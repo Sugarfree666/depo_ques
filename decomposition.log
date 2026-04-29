@@ -1,0 +1,614 @@
+
+================================================================================
+[2026-04-29T20:24:16] Run started
+================================================================================
+
+--- configuration ---
+{
+  "model": "gpt-4o-mini",
+  "base_url": "https://api.chatanywhere.tech",
+  "questions_file": "questions.json",
+  "question_count": 1,
+  "index": 0,
+  "all": false,
+  "limit": null,
+  "output": null,
+  "log_file": "decomposition.log",
+  "append_log": false,
+  "custom_question": true
+}
+
+================================================================================
+[2026-04-29T20:24:16] Question 1/1
+================================================================================
+
+--- original question ---
+Do director of film Ten9Eight: Shoot For The Moon and director of film Sabotage (1936 Film) share the same nationality?
+
+--- Stage 1: query AST and semantic graph request ---
+{
+  "model": "gpt-4o-mini",
+  "temperature": 0.0,
+  "response_format": {
+    "type": "json_object"
+  },
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a rigorous semantic parser for hypergraph RAG question decomposition.\n\nYour job is to transform a complex natural-language question into:\n1. entity variables: concrete named entities or literal anchors from the question.\n2. type variables: answerable typed variables, such as company, CEO, university, city.\n3. dependency-style relation evidence.\n4. a Query AST that organizes variables and relations like a compiler would.\n5. a semantic graph whose one-hop edges can each be verbalized as exactly one atomic subquestion.\n\nRules:\n- Preserve every constraint in the original question.\n- Do not merge two relations into one graph edge.\n- A graph edge must connect exactly two variables and represent one predicate/relation.\n- Prefer a chain or small tree that supports step-by-step retrieval.\n- Use stable ids: v1, v2, ... for variables; r1, r2, ... for relations/edges.\n- If a relation is implicit, infer the most conservative relation phrase and mark evidence as \"implicit\".\n- Keep surface text in the same language as the input question when possible.\n- Output valid JSON only. Do not wrap the JSON in Markdown.\n"
+    },
+    {
+      "role": "user",
+      "content": "Parse the complex question into entity/type variables, a Query AST, and a one-hop semantic graph.\n\nReturn exactly this JSON shape:\n{\n  \"question\": \"...\",\n  \"variables\": [\n    {\n      \"id\": \"v1\",\n      \"surface\": \"AlphaGo\",\n      \"kind\": \"entity\",\n      \"type_hint\": \"system/product\",\n      \"is_anchor\": true,\n      \"description\": \"concrete entity mentioned in the question\"\n    }\n  ],\n  \"dependency_evidence\": [\n    {\n      \"id\": \"d1\",\n      \"head\": \"v2\",\n      \"dependent\": \"v1\",\n      \"relation_phrase\": \"developed\",\n      \"evidence_text\": \"developed AlphaGo\"\n    }\n  ],\n  \"query_ast\": {\n    \"node_type\": \"answer\",\n    \"variable\": \"v5\",\n    \"children\": [\n      {\n        \"node_type\": \"relation\",\n        \"relation_id\": \"r4\",\n        \"source\": \"v4\",\n        \"target\": \"v5\",\n        \"children\": []\n      }\n    ]\n  },\n  \"semantic_graph\": {\n    \"nodes\": [\n      {\n        \"id\": \"v1\",\n        \"label\": \"AlphaGo\",\n        \"kind\": \"entity\",\n        \"type_hint\": \"system/product\"\n      }\n    ],\n    \"edges\": [\n      {\n        \"id\": \"r1\",\n        \"source\": \"v2\",\n        \"target\": \"v1\",\n        \"relation\": \"developed\",\n        \"source_role\": \"developer\",\n        \"target_role\": \"developed object\",\n        \"evidence\": \"developed AlphaGo\"\n      }\n    ]\n  },\n  \"root_answer_variable\": \"v5\",\n  \"parse_notes\": [\"...\"]\n}\n\nQuestion:\nDo director of film Ten9Eight: Shoot For The Moon and director of film Sabotage (1936 Film) share the same nationality?\n"
+    }
+  ]
+}
+
+--- Stage 1: query AST and semantic graph raw response ---
+{
+  "question": "Do director of film Ten9Eight: Shoot For The Moon and director of film Sabotage (1936 Film) share the same nationality?",
+  "variables": [
+    {
+      "id": "v1",
+      "surface": "Ten9Eight: Shoot For The Moon",
+      "kind": "entity",
+      "type_hint": "film",
+      "is_anchor": true,
+      "description": "film mentioned in the question"
+    },
+    {
+      "id": "v2",
+      "surface": "Sabotage",
+      "kind": "entity",
+      "type_hint": "film",
+      "is_anchor": true,
+      "description": "film mentioned in the question"
+    },
+    {
+      "id": "v3",
+      "surface": "director of Ten9Eight: Shoot For The Moon",
+      "kind": "entity",
+      "type_hint": "person",
+      "is_anchor": false,
+      "description": "director of the film Ten9Eight: Shoot For The Moon"
+    },
+    {
+      "id": "v4",
+      "surface": "director of Sabotage",
+      "kind": "entity",
+      "type_hint": "person",
+      "is_anchor": false,
+      "description": "director of the film Sabotage (1936 Film)"
+    },
+    {
+      "id": "v5",
+      "surface": "nationality",
+      "kind": "type",
+      "type_hint": "nationality",
+      "is_anchor": true,
+      "description": "the shared nationality of the two directors"
+    }
+  ],
+  "dependency_evidence": [
+    {
+      "id": "d1",
+      "head": "v3",
+      "dependent": "v1",
+      "relation_phrase": "is director of",
+      "evidence_text": "director of film Ten9Eight: Shoot For The Moon"
+    },
+    {
+      "id": "d2",
+      "head": "v4",
+      "dependent": "v2",
+      "relation_phrase": "is director of",
+      "evidence_text": "director of film Sabotage (1936 Film)"
+    }
+  ],
+  "query_ast": {
+    "node_type": "answer",
+    "variable": "v5",
+    "children": [
+      {
+        "node_type": "relation",
+        "relation_id": "r3",
+        "source": "v3",
+        "target": "v4",
+        "children": []
+      }
+    ]
+  },
+  "semantic_graph": {
+    "nodes": [
+      {
+        "id": "v1",
+        "label": "Ten9Eight: Shoot For The Moon",
+        "kind": "entity",
+        "type_hint": "film"
+      },
+      {
+        "id": "v2",
+        "label": "Sabotage",
+        "kind": "entity",
+        "type_hint": "film"
+      },
+      {
+        "id": "v3",
+        "label": "director of Ten9Eight: Shoot For The Moon",
+        "kind": "entity",
+        "type_hint": "person"
+      },
+      {
+        "id": "v4",
+        "label": "director of Sabotage",
+        "kind": "entity",
+        "type_hint": "person"
+      }
+    ],
+    "edges": [
+      {
+        "id": "r1",
+        "source": "v3",
+        "target": "v1",
+        "relation": "is director of",
+        "source_role": "director",
+        "target_role": "film",
+        "evidence": "director of film Ten9Eight: Shoot For The Moon"
+      },
+      {
+        "id": "r2",
+        "source": "v4",
+        "target": "v2",
+        "relation": "is director of",
+        "source_role": "director",
+        "target_role": "film",
+        "evidence": "director of film Sabotage (1936 Film)"
+      }
+    ]
+  },
+  "root_answer_variable": "v5",
+  "parse_notes": ["The question investigates the nationality of two directors connected to specific films, ensuring both films and their directors are explicitly represented."]
+}
+
+--- Stage 1: query AST and semantic graph parsed JSON ---
+{
+  "question": "Do director of film Ten9Eight: Shoot For The Moon and director of film Sabotage (1936 Film) share the same nationality?",
+  "variables": [
+    {
+      "id": "v1",
+      "surface": "Ten9Eight: Shoot For The Moon",
+      "kind": "entity",
+      "type_hint": "film",
+      "is_anchor": true,
+      "description": "film mentioned in the question"
+    },
+    {
+      "id": "v2",
+      "surface": "Sabotage",
+      "kind": "entity",
+      "type_hint": "film",
+      "is_anchor": true,
+      "description": "film mentioned in the question"
+    },
+    {
+      "id": "v3",
+      "surface": "director of Ten9Eight: Shoot For The Moon",
+      "kind": "entity",
+      "type_hint": "person",
+      "is_anchor": false,
+      "description": "director of the film Ten9Eight: Shoot For The Moon"
+    },
+    {
+      "id": "v4",
+      "surface": "director of Sabotage",
+      "kind": "entity",
+      "type_hint": "person",
+      "is_anchor": false,
+      "description": "director of the film Sabotage (1936 Film)"
+    },
+    {
+      "id": "v5",
+      "surface": "nationality",
+      "kind": "type",
+      "type_hint": "nationality",
+      "is_anchor": true,
+      "description": "the shared nationality of the two directors"
+    }
+  ],
+  "dependency_evidence": [
+    {
+      "id": "d1",
+      "head": "v3",
+      "dependent": "v1",
+      "relation_phrase": "is director of",
+      "evidence_text": "director of film Ten9Eight: Shoot For The Moon"
+    },
+    {
+      "id": "d2",
+      "head": "v4",
+      "dependent": "v2",
+      "relation_phrase": "is director of",
+      "evidence_text": "director of film Sabotage (1936 Film)"
+    }
+  ],
+  "query_ast": {
+    "node_type": "answer",
+    "variable": "v5",
+    "children": [
+      {
+        "node_type": "relation",
+        "relation_id": "r3",
+        "source": "v3",
+        "target": "v4",
+        "children": []
+      }
+    ]
+  },
+  "semantic_graph": {
+    "nodes": [
+      {
+        "id": "v1",
+        "label": "Ten9Eight: Shoot For The Moon",
+        "kind": "entity",
+        "type_hint": "film"
+      },
+      {
+        "id": "v2",
+        "label": "Sabotage",
+        "kind": "entity",
+        "type_hint": "film"
+      },
+      {
+        "id": "v3",
+        "label": "director of Ten9Eight: Shoot For The Moon",
+        "kind": "entity",
+        "type_hint": "person"
+      },
+      {
+        "id": "v4",
+        "label": "director of Sabotage",
+        "kind": "entity",
+        "type_hint": "person"
+      }
+    ],
+    "edges": [
+      {
+        "id": "r1",
+        "source": "v3",
+        "target": "v1",
+        "relation": "is director of",
+        "source_role": "director",
+        "target_role": "film",
+        "evidence": "director of film Ten9Eight: Shoot For The Moon"
+      },
+      {
+        "id": "r2",
+        "source": "v4",
+        "target": "v2",
+        "relation": "is director of",
+        "source_role": "director",
+        "target_role": "film",
+        "evidence": "director of film Sabotage (1936 Film)"
+      }
+    ]
+  },
+  "root_answer_variable": "v5",
+  "parse_notes": [
+    "The question investigates the nationality of two directors connected to specific films, ensuring both films and their directors are explicitly represented."
+  ]
+}
+
+--- Stage 2: atomic subquestions request ---
+{
+  "model": "gpt-4o-mini",
+  "temperature": 0.0,
+  "response_format": {
+    "type": "json_object"
+  },
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a rigorous semantic parser for hypergraph RAG question decomposition.\n\nYour job is to transform a complex natural-language question into:\n1. entity variables: concrete named entities or literal anchors from the question.\n2. type variables: answerable typed variables, such as company, CEO, university, city.\n3. dependency-style relation evidence.\n4. a Query AST that organizes variables and relations like a compiler would.\n5. a semantic graph whose one-hop edges can each be verbalized as exactly one atomic subquestion.\n\nRules:\n- Preserve every constraint in the original question.\n- Do not merge two relations into one graph edge.\n- A graph edge must connect exactly two variables and represent one predicate/relation.\n- Prefer a chain or small tree that supports step-by-step retrieval.\n- Use stable ids: v1, v2, ... for variables; r1, r2, ... for relations/edges.\n- If a relation is implicit, infer the most conservative relation phrase and mark evidence as \"implicit\".\n- Keep surface text in the same language as the input question when possible.\n- Output valid JSON only. Do not wrap the JSON in Markdown.\n"
+    },
+    {
+      "role": "user",
+      "content": "Generate one-hop atomic subquestions from the semantic graph.\n\nInput parse JSON:\n{\n  \"question\": \"Do director of film Ten9Eight: Shoot For The Moon and director of film Sabotage (1936 Film) share the same nationality?\",\n  \"variables\": [\n    {\n      \"id\": \"v1\",\n      \"surface\": \"Ten9Eight: Shoot For The Moon\",\n      \"kind\": \"entity\",\n      \"type_hint\": \"film\",\n      \"is_anchor\": true,\n      \"description\": \"film mentioned in the question\"\n    },\n    {\n      \"id\": \"v2\",\n      \"surface\": \"Sabotage\",\n      \"kind\": \"entity\",\n      \"type_hint\": \"film\",\n      \"is_anchor\": true,\n      \"description\": \"film mentioned in the question\"\n    },\n    {\n      \"id\": \"v3\",\n      \"surface\": \"director of Ten9Eight: Shoot For The Moon\",\n      \"kind\": \"entity\",\n      \"type_hint\": \"person\",\n      \"is_anchor\": false,\n      \"description\": \"director of the film Ten9Eight: Shoot For The Moon\"\n    },\n    {\n      \"id\": \"v4\",\n      \"surface\": \"director of Sabotage\",\n      \"kind\": \"entity\",\n      \"type_hint\": \"person\",\n      \"is_anchor\": false,\n      \"description\": \"director of the film Sabotage (1936 Film)\"\n    },\n    {\n      \"id\": \"v5\",\n      \"surface\": \"nationality\",\n      \"kind\": \"type\",\n      \"type_hint\": \"nationality\",\n      \"is_anchor\": true,\n      \"description\": \"the shared nationality of the two directors\"\n    }\n  ],\n  \"dependency_evidence\": [\n    {\n      \"id\": \"d1\",\n      \"head\": \"v3\",\n      \"dependent\": \"v1\",\n      \"relation_phrase\": \"is director of\",\n      \"evidence_text\": \"director of film Ten9Eight: Shoot For The Moon\"\n    },\n    {\n      \"id\": \"d2\",\n      \"head\": \"v4\",\n      \"dependent\": \"v2\",\n      \"relation_phrase\": \"is director of\",\n      \"evidence_text\": \"director of film Sabotage (1936 Film)\"\n    }\n  ],\n  \"query_ast\": {\n    \"node_type\": \"answer\",\n    \"variable\": \"v5\",\n    \"children\": [\n      {\n        \"node_type\": \"relation\",\n        \"relation_id\": \"r3\",\n        \"source\": \"v3\",\n        \"target\": \"v4\",\n        \"children\": []\n      }\n    ]\n  },\n  \"semantic_graph\": {\n    \"nodes\": [\n      {\n        \"id\": \"v1\",\n        \"label\": \"Ten9Eight: Shoot For The Moon\",\n        \"kind\": \"entity\",\n        \"type_hint\": \"film\"\n      },\n      {\n        \"id\": \"v2\",\n        \"label\": \"Sabotage\",\n        \"kind\": \"entity\",\n        \"type_hint\": \"film\"\n      },\n      {\n        \"id\": \"v3\",\n        \"label\": \"director of Ten9Eight: Shoot For The Moon\",\n        \"kind\": \"entity\",\n        \"type_hint\": \"person\"\n      },\n      {\n        \"id\": \"v4\",\n        \"label\": \"director of Sabotage\",\n        \"kind\": \"entity\",\n        \"type_hint\": \"person\"\n      }\n    ],\n    \"edges\": [\n      {\n        \"id\": \"r1\",\n        \"source\": \"v3\",\n        \"target\": \"v1\",\n        \"relation\": \"is director of\",\n        \"source_role\": \"director\",\n        \"target_role\": \"film\",\n        \"evidence\": \"director of film Ten9Eight: Shoot For The Moon\"\n      },\n      {\n        \"id\": \"r2\",\n        \"source\": \"v4\",\n        \"target\": \"v2\",\n        \"relation\": \"is director of\",\n        \"source_role\": \"director\",\n        \"target_role\": \"film\",\n        \"evidence\": \"director of film Sabotage (1936 Film)\"\n      }\n    ]\n  },\n  \"root_answer_variable\": \"v5\",\n  \"parse_notes\": [\n    \"The question investigates the nationality of two directors connected to specific films, ensuring both films and their directors are explicitly represented.\"\n  ]\n}\n\nReturn exactly this JSON shape:\n{\n  \"atomic_subquestions\": [\n    {\n      \"id\": \"q1\",\n      \"edge_id\": \"r1\",\n      \"known_variables\": [\"v1\"],\n      \"unknown_variable\": \"v2\",\n      \"question\": \"Which artificial intelligence company developed AlphaGo?\",\n      \"answer_placeholder\": \"X1\",\n      \"depends_on\": [],\n      \"reason\": \"one-hop relation between AlphaGo and artificial intelligence company\"\n    }\n  ],\n  \"execution_order\": [\"q1\"],\n  \"final_answer_variable\": \"v5\",\n  \"quality_checks\": {\n    \"all_edges_covered\": true,\n    \"each_question_one_hop\": true,\n    \"notes\": []\n  }\n}\n\nRules:\n- Each atomic subquestion must use exactly one semantic_graph edge.\n- If neither endpoint is a concrete anchor, depend on the previous placeholder that makes it answerable.\n- Use placeholders X1, X2, ... for intermediate answers.\n- The output should form a retrieval plan from concrete anchors toward the root_answer_variable when possible.\n- Keep subquestions concise and answerable.\n- Output valid JSON only. Do not wrap the JSON in Markdown.\n"
+    }
+  ]
+}
+
+--- Stage 2: atomic subquestions raw response ---
+{
+  "atomic_subquestions": [
+    {
+      "id": "q1",
+      "edge_id": "r1",
+      "known_variables": ["v1"],
+      "unknown_variable": "v3",
+      "question": "Who is the director of the film Ten9Eight: Shoot For The Moon?",
+      "answer_placeholder": "X1",
+      "depends_on": [],
+      "reason": "one-hop relation between Ten9Eight: Shoot For The Moon and its director"
+    },
+    {
+      "id": "q2",
+      "edge_id": "r2",
+      "known_variables": ["v2"],
+      "unknown_variable": "v4",
+      "question": "Who is the director of the film Sabotage?",
+      "answer_placeholder": "X2",
+      "depends_on": [],
+      "reason": "one-hop relation between Sabotage and its director"
+    },
+    {
+      "id": "q3",
+      "edge_id": "r3",
+      "known_variables": ["X1", "X2"],
+      "unknown_variable": "v5",
+      "question": "Do directors X1 and X2 share the same nationality?",
+      "answer_placeholder": "Y1",
+      "depends_on": ["q1", "q2"],
+      "reason": "one-hop relation checking nationality of the two directors"
+    }
+  ],
+  "execution_order": ["q1", "q2", "q3"],
+  "final_answer_variable": "v5",
+  "quality_checks": {
+    "all_edges_covered": true,
+    "each_question_one_hop": true,
+    "notes": []
+  }
+}
+
+--- Stage 2: atomic subquestions parsed JSON ---
+{
+  "atomic_subquestions": [
+    {
+      "id": "q1",
+      "edge_id": "r1",
+      "known_variables": [
+        "v1"
+      ],
+      "unknown_variable": "v3",
+      "question": "Who is the director of the film Ten9Eight: Shoot For The Moon?",
+      "answer_placeholder": "X1",
+      "depends_on": [],
+      "reason": "one-hop relation between Ten9Eight: Shoot For The Moon and its director"
+    },
+    {
+      "id": "q2",
+      "edge_id": "r2",
+      "known_variables": [
+        "v2"
+      ],
+      "unknown_variable": "v4",
+      "question": "Who is the director of the film Sabotage?",
+      "answer_placeholder": "X2",
+      "depends_on": [],
+      "reason": "one-hop relation between Sabotage and its director"
+    },
+    {
+      "id": "q3",
+      "edge_id": "r3",
+      "known_variables": [
+        "X1",
+        "X2"
+      ],
+      "unknown_variable": "v5",
+      "question": "Do directors X1 and X2 share the same nationality?",
+      "answer_placeholder": "Y1",
+      "depends_on": [
+        "q1",
+        "q2"
+      ],
+      "reason": "one-hop relation checking nationality of the two directors"
+    }
+  ],
+  "execution_order": [
+    "q1",
+    "q2",
+    "q3"
+  ],
+  "final_answer_variable": "v5",
+  "quality_checks": {
+    "all_edges_covered": true,
+    "each_question_one_hop": true,
+    "notes": []
+  }
+}
+
+--- compact semantic graph ---
+director of Ten9Eight: Shoot For The Moon->Ten9Eight: Shoot For The Moon；director of Sabotage->Sabotage
+
+--- console output block ---
+原始问题：Do director of film Ten9Eight: Shoot For The Moon and director of film Sabotage (1936 Film) share the same nationality?
+关系语义图：director of Ten9Eight: Shoot For The Moon->Ten9Eight: Shoot For The Moon；director of Sabotage->Sabotage
+分解后的子问题：
+1. Who is the director of the film Ten9Eight: Shoot For The Moon?
+2. Who is the director of the film Sabotage?
+3. Do directors X1 and X2 share the same nationality?
+
+--- merged final result ---
+{
+  "question": "Do director of film Ten9Eight: Shoot For The Moon and director of film Sabotage (1936 Film) share the same nationality?",
+  "variables": [
+    {
+      "id": "v1",
+      "surface": "Ten9Eight: Shoot For The Moon",
+      "kind": "entity",
+      "type_hint": "film",
+      "is_anchor": true,
+      "description": "film mentioned in the question"
+    },
+    {
+      "id": "v2",
+      "surface": "Sabotage",
+      "kind": "entity",
+      "type_hint": "film",
+      "is_anchor": true,
+      "description": "film mentioned in the question"
+    },
+    {
+      "id": "v3",
+      "surface": "director of Ten9Eight: Shoot For The Moon",
+      "kind": "entity",
+      "type_hint": "person",
+      "is_anchor": false,
+      "description": "director of the film Ten9Eight: Shoot For The Moon"
+    },
+    {
+      "id": "v4",
+      "surface": "director of Sabotage",
+      "kind": "entity",
+      "type_hint": "person",
+      "is_anchor": false,
+      "description": "director of the film Sabotage (1936 Film)"
+    },
+    {
+      "id": "v5",
+      "surface": "nationality",
+      "kind": "type",
+      "type_hint": "nationality",
+      "is_anchor": true,
+      "description": "the shared nationality of the two directors"
+    }
+  ],
+  "dependency_evidence": [
+    {
+      "id": "d1",
+      "head": "v3",
+      "dependent": "v1",
+      "relation_phrase": "is director of",
+      "evidence_text": "director of film Ten9Eight: Shoot For The Moon"
+    },
+    {
+      "id": "d2",
+      "head": "v4",
+      "dependent": "v2",
+      "relation_phrase": "is director of",
+      "evidence_text": "director of film Sabotage (1936 Film)"
+    }
+  ],
+  "query_ast": {
+    "node_type": "answer",
+    "variable": "v5",
+    "children": [
+      {
+        "node_type": "relation",
+        "relation_id": "r3",
+        "source": "v3",
+        "target": "v4",
+        "children": []
+      }
+    ]
+  },
+  "semantic_graph": {
+    "nodes": [
+      {
+        "id": "v1",
+        "label": "Ten9Eight: Shoot For The Moon",
+        "kind": "entity",
+        "type_hint": "film"
+      },
+      {
+        "id": "v2",
+        "label": "Sabotage",
+        "kind": "entity",
+        "type_hint": "film"
+      },
+      {
+        "id": "v3",
+        "label": "director of Ten9Eight: Shoot For The Moon",
+        "kind": "entity",
+        "type_hint": "person"
+      },
+      {
+        "id": "v4",
+        "label": "director of Sabotage",
+        "kind": "entity",
+        "type_hint": "person"
+      }
+    ],
+    "edges": [
+      {
+        "id": "r1",
+        "source": "v3",
+        "target": "v1",
+        "relation": "is director of",
+        "source_role": "director",
+        "target_role": "film",
+        "evidence": "director of film Ten9Eight: Shoot For The Moon"
+      },
+      {
+        "id": "r2",
+        "source": "v4",
+        "target": "v2",
+        "relation": "is director of",
+        "source_role": "director",
+        "target_role": "film",
+        "evidence": "director of film Sabotage (1936 Film)"
+      }
+    ]
+  },
+  "root_answer_variable": "v5",
+  "parse_notes": [
+    "The question investigates the nationality of two directors connected to specific films, ensuring both films and their directors are explicitly represented."
+  ],
+  "atomic_subquestions": [
+    {
+      "id": "q1",
+      "edge_id": "r1",
+      "known_variables": [
+        "v1"
+      ],
+      "unknown_variable": "v3",
+      "question": "Who is the director of the film Ten9Eight: Shoot For The Moon?",
+      "answer_placeholder": "X1",
+      "depends_on": [],
+      "reason": "one-hop relation between Ten9Eight: Shoot For The Moon and its director"
+    },
+    {
+      "id": "q2",
+      "edge_id": "r2",
+      "known_variables": [
+        "v2"
+      ],
+      "unknown_variable": "v4",
+      "question": "Who is the director of the film Sabotage?",
+      "answer_placeholder": "X2",
+      "depends_on": [],
+      "reason": "one-hop relation between Sabotage and its director"
+    },
+    {
+      "id": "q3",
+      "edge_id": "r3",
+      "known_variables": [
+        "X1",
+        "X2"
+      ],
+      "unknown_variable": "v5",
+      "question": "Do directors X1 and X2 share the same nationality?",
+      "answer_placeholder": "Y1",
+      "depends_on": [
+        "q1",
+        "q2"
+      ],
+      "reason": "one-hop relation checking nationality of the two directors"
+    }
+  ],
+  "execution_order": [
+    "q1",
+    "q2",
+    "q3"
+  ],
+  "final_answer_variable": "v5",
+  "quality_checks": {
+    "all_edges_covered": true,
+    "each_question_one_hop": true,
+    "notes": []
+  }
+}
+
+================================================================================
+[2026-04-29T20:24:32] Run completed
+================================================================================
