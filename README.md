@@ -1,91 +1,87 @@
-# Hypergraph RAG Semantic Decomposer
+# English Complex Question Decomposer
 
-This repository contains a small CLI prototype for validating entity/type-variable based decomposition of complex questions.
+This repository implements a strict decomposition pipeline for English complex questions:
 
-It reads a complex question, asks `gpt-4o-mini` to build a compiler-style Query AST and one-hop semantic graph, then asks the model to generate atomic subquestions from graph edges.
+```text
+Complex Question
+-> Entity / Type Variable Recognition
+-> Dependency Parsing
+-> Query AST Construction
+-> Entity-Type Variable Syntax Tree
+-> One-hop Relation-based Atomic Subquestion Generation
+```
 
-## Configuration
+LLM usage is restricted to two stages:
 
-Set the API key and optional OpenAI-compatible base URL:
+- `mention_extraction`: extract constants, variables, and answer variables.
+- `subquestion_verbalization`: verbalize one program-generated `SubquestionPlan` into one English atomic question.
+
+Dependency parsing, typed-clause normalization, Query AST construction, semantic graph construction, syntax tree construction, execution planning, validation, and quality checks are all deterministic Python code.
+
+## Setup
+
+The CLI uses an OpenAI-compatible `/chat/completions` endpoint:
 
 ```powershell
 $env:OPENAI_API_KEY="your_api_key"
 $env:OPENAI_BASE_URL="https://api.openai.com/v1"
 ```
 
-You can also pass them directly:
-
-```powershell
-python semantic_decomposer.py --api-key "your_api_key" --base-url "https://api.openai.com/v1"
-```
+The parser uses spaCy with `en_core_web_sm` when available. If spaCy or the model is not installed, it falls back to a deterministic rule-based English parser so the pipeline remains testable without network access.
 
 ## Usage
 
-Process the first question in `questions.json`:
+Run a custom question:
 
 ```powershell
-python semantic_decomposer.py
+python semantic_decomposer.py --question "Which university did the CEO of the artificial intelligence company that developed AlphaGo graduate from, and in which city is that university located?"
 ```
 
-Process a specific question by 0-based index:
+Run a question from `questions.json`:
 
 ```powershell
-python semantic_decomposer.py --index 3
+python semantic_decomposer.py --index 0
+python semantic_decomposer.py --all --limit 5 --output results.json
 ```
 
-Process every question, or a limited batch:
-
-```powershell
-python semantic_decomposer.py --all --output results.json
-python semantic_decomposer.py --all --limit 5 --output sample_results.json
-```
-
-Process a custom question:
-
-```powershell
-python semantic_decomposer.py --question "研发了 AlphaGo 的那家人工智能公司的 CEO 毕业于哪所大学，这所大学位于哪座城市？"
-```
-
-Write the detailed process log to a custom file:
+Write or disable the process log:
 
 ```powershell
 python semantic_decomposer.py --index 0 --log-file logs\decomposition_0.log
-```
-
-Disable the process log:
-
-```powershell
 python semantic_decomposer.py --index 0 --no-log
 ```
 
 ## Output
 
-Console output is concise:
+The CLI prints JSON with these top-level keys:
 
-```text
-原始问题：研发了 AlphaGo 的那家人工智能公司的 CEO 毕业于哪所大学，这所大学位于哪座城市？
-关系语义图：AlphaGo<-人工智能公司->CEO->大学->城市
-分解后的子问题：
-1. 哪家人工智能公司研发了 AlphaGo？
-2. 这家人工智能公司的 CEO 是谁？
-3. 这位 CEO 毕业于哪所大学？
-4. 这所大学位于哪座城市？
+- `mentions`
+- `raw_dependency_parse`
+- `typed_clauses`
+- `query_ast`
+- `variable_syntax_tree`
+- `semantic_graph`
+- `subquestion_plans`
+- `execution_order`
+- `atomic_subquestions`
+- `programmatic_quality_checks`
+
+The quality checks are computed by Python:
+
+```json
+{
+  "ast_valid": true,
+  "graph_edges_match_ast_relations": true,
+  "all_subquestions_reference_existing_edges": true,
+  "answer_variable_reachable": true,
+  "llm_used_only_for_mentions_and_verbalization": true
+}
 ```
 
-When `--output` is provided, the file still receives the full JSON result, including:
+## Tests
 
-- `variables`: extracted entities and type variables.
-- `dependency_evidence`: relation evidence from dependency-style parsing.
-- `query_ast`: the generated query syntax tree.
-- `semantic_graph`: nodes and one-hop relation edges.
-- `atomic_subquestions`: one-hop subquestions with placeholders and dependencies.
-- `execution_order`: suggested retrieval order.
+Run the test suite with:
 
-By default, `decomposition.log` records the full decomposition process:
-
-- run configuration without the API key.
-- original question.
-- stage 1 request and response for entity/type variables, Query AST, and semantic graph.
-- stage 2 request and response for one-hop atomic subquestions.
-- compact semantic graph shown in the console.
-- merged final JSON result.
+```powershell
+python -m unittest discover -s tests
+```
