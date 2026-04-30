@@ -426,12 +426,11 @@ class DependencyParser:
 
     @staticmethod
     def _has_stanza_model(language: str) -> bool:
-        try:
-            from stanza.resources.common import DEFAULT_MODEL_DIR
-        except Exception:
-            return False
-        resources_path = Path(DEFAULT_MODEL_DIR) / "resources.json"
-        language_path = Path(DEFAULT_MODEL_DIR) / language
+        resource_dir = os.getenv("STANZA_RESOURCES_DIR")
+        if not resource_dir:
+            resource_dir = str(Path.home() / "stanza_resources")
+        resources_path = Path(resource_dir) / "resources.json"
+        language_path = Path(resource_dir) / language
         return resources_path.exists() and language_path.exists()
 
     def _parse_with_spacy(self, text: str, language: str) -> Optional[ParseResult]:
