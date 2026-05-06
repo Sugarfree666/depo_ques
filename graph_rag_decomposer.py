@@ -1,1064 +1,1294 @@
 #!/usr/bin/env python3
 """
-Dependency-tree + Query-AST based complex question decomposer.
+Query-AST decomposer for entity/type-variable based Graph-RAG research.
 
-This script validates a Graph-RAG style decomposition pipeline:
-1. Use an LLM to extract the ordered query entities / type variables.
-2. Run dependency parsing with spaCy or stanza.
-3. Collapse entity spans onto the dependency tree to build a Query AST.
-4. Convert the token-level AST into an entity relation graph.
-5. Traverse each one-hop edge and ask an LLM to generate an atomic sub-question.
+The pipeline is intentionally close to the research idea:
+1. Ask gpt-4o-mini to identify entities, type variables, relation words, and a
+   compiler-style Query AST.
+2. Validate the AST locally.
+3. Traverse every one-hop graph edge.
+4. Ask gpt-4o-mini to turn each one-hop edge into an atomic sub-question.
 
-Suggested installation:
-    pip install openai networkx spacy stanza
-    python -m spacy download zh_core_web_sm
-    python -m spacy download en_core_web_sm
-    python -c "import stanza; stanza.download('zh'); stanza.download('en')"
+The script uses only the Python standard library and an OpenAI-compatible
+chat/completions endpoint, so it works with api_key + base_url without requiring
+the openai package.
 
 Examples:
-    python graph_rag_decomposer.py --question "研发了 AlphaGo 的那家人工智能公司的 CEO 毕业于哪所大学，这所大学位于哪座城市？"
-    python graph_rag_decomposer.py --question-file questions.json --index 0
+    python graph_rag_decomposer.py --index 0
+    python graph_rag_decomposer.py --question "Which university did the CEO of the artificial intelligence company that developed AlphaGo graduate from and in which city is this university located?"
+    python graph_rag_decomposer.py --question-file questions.json --index 3 --format json
+    python graph_rag_decomposer.py --mock --question "Do director of film Ten9Eight: Shoot For The Moon and director of film Sabotage (1936 Film) share the same nationality?"
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
-import logging
 import os
 import re
 import sys
-import traceback
-import warnings
-from dataclasses import dataclass
-from datetime import datetime, timezone
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-
-import networkx as nx
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-# OpenAI configuration placeholders. Replace them directly if you do not want
-# to use environment variables.
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "YOUR_API_KEY")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-ENTITY_MODEL = "gpt-4o-mini"
-QUESTION_MODEL = "gpt-4o-mini"
-
-DEFAULT_SAMPLE_QUESTION = (
-    "研发了 AlphaGo 的那家人工智能公司的 CEO 毕业于哪所大学，这所大学位于哪座城市？"
-)
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+DEFAULT_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 DEFAULT_QUESTION_FILE = "questions.json"
-PLACEHOLDER_POOL = ["X", "Y", "Z", "W", "V", "U", "T", "S", "R", "Q", "P"]
 
 
-warnings.filterwarnings("ignore")
-logging.getLogger("httpx").setLevel(logging.ERROR)
-logging.getLogger("openai").setLevel(logging.ERROR)
-logging.getLogger("stanza").setLevel(logging.ERROR)
-logging.getLogger("transformers").setLevel(logging.ERROR)
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+AST_SYSTEM_PROMPT = """
+You are a compiler-style semantic parser for complex question decomposition in Graph-RAG.
+Your job is to convert one complex natural-language question into a Query AST over entities and type variables.
+
+Return JSON only. Do not use markdown.
+
+Required JSON schema:
+{
+  "question_type": "multi_hop|parallel|hybrid",
+  "root_nodes": ["node_id"],
+  "answer_nodes": ["node_id"],
+  "nodes": [
+    {
+      "id": "stable_node_id",
+      "label": "surface text or concise variable name",
+      "kind": "entity|type_variable|role_variable|value_variable",
+      "semantic_type": "optional type, e.g. Person, University, City, Nationality, AI_Company",
+      "source_span": "exact or near-exact phrase from the question"
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "order": 1,
+      "source": "node_id",
+      "target": "node_id",
+      "relation": "short_relation_name",
+      "surface": "relation phrase in the original question",
+      "direction": "why the source -> target direction is correct",
+      "confidence": 0.0
+    }
+  ],
+  "operations": [
+    {
+      "id": "op1",
+      "operator": "equals|not_equals|compare|count|argmax|argmin|intersection|union|and|or",
+      "left": "node_id",
+      "right": "node_id",
+      "output": "optional output node id",
+      "description": "short description"
+    }
+  ],
+  "notes": "short optional note"
+}
+
+Rules:
+- Extract the minimal entities/type variables needed to answer the question.
+- Use concrete named things as kind=entity.
+- Use generic answer slots such as company, CEO, university, city, director, nationality as variables.
+- Variable ids should start with x_, for example x_company, x_ceo, x_university, x_city.
+- Every edge must be one atomic one-hop relation. Never merge two relations into one edge.
+- Preserve intermediate variables whenever an answer feeds a later hop.
+- For multi-hop questions, build a chain or small tree from grounded entity to final answer variable.
+- For parallel questions, build separate branches and put comparison/equality in operations.
+- Orient retrieval edges from known/current subject to the next unknown target.
+- Put all compare/same/different logic in operations, not retrieval edges.
+- Keep relation names concise and machine-readable, such as developed_by, ceo_of, graduated_from, located_in, directed_by, has_nationality.
+- The output language of labels can follow the question, but ids and relation names should be ASCII.
+
+Two examples:
+Question: Which university did the CEO of the artificial intelligence company that developed AlphaGo graduate from and in which city is this university located?
+AST edges should be equivalent to:
+AlphaGo --developed_by--> x_company:AI_Company --ceo_of--> x_ceo:Person --graduated_from--> x_university:University --located_in--> x_city:City
+
+Question: Do director of film Ten9Eight: Shoot For The Moon and director of film Sabotage (1936 Film) share the same nationality?
+AST edges should be equivalent to two branches:
+Ten9Eight --directed_by--> x_director_1 --has_nationality--> x_nationality_1
+Sabotage --directed_by--> x_director_2 --has_nationality--> x_nationality_2
+operation equals(x_nationality_1, x_nationality_2)
+""".strip()
+
+
+ATOMIC_SYSTEM_PROMPT = """
+You generate atomic one-hop sub-questions from a validated Query AST.
+
+Return JSON only. Do not use markdown.
+
+Required JSON schema:
+{
+  "atomic_questions": [
+    {
+      "edge_id": "e1",
+      "question": "one natural-language atomic question",
+      "input_binding": "source variable id if the source is a variable, else empty string",
+      "output_binding": "target variable id if the target is a variable, else empty string",
+      "depends_on": ["edge_id"]
+    }
+  ],
+  "operation_questions": [
+    {
+      "operation_id": "op1",
+      "question": "optional final non-retrieval operation question",
+      "depends_on": ["edge_id"]
+    }
+  ]
+}
+
+Rules:
+- Generate exactly one atomic question for each retrieval edge.
+- Use the same language as the original question.
+- Ask only for the target node of that edge.
+- Do not include later hops or comparison logic in a retrieval atomic question.
+- If the source node is a concrete entity, use its label literally.
+- If the source node is a variable, use its id literally, such as x_company or x_director_1.
+- If the target node is a variable, output_binding must be that target id.
+- For parallel comparisons, generate retrieval questions for every branch, then put equality/same/different checks in operation_questions.
+- Keep every atomic question short and directly answerable by one relation.
+""".strip()
 
 
 @dataclass
-class TokenInfo:
-    index: int
-    text: str
-    lemma: str
-    pos: str
-    dep: str
-    head: int
-    start_char: int
-    end_char: int
-
-
-@dataclass
-class ParseResult:
-    language: str
-    backend: str
-    tokens: List[TokenInfo]
-    root_index: int
-
-
-@dataclass
-class EntityNode:
-    node_id: str
-    text: str
-    canonical: str
+class ASTNode:
+    id: str
+    label: str
     kind: str
-    mention_start: int = -1
-    mention_end: int = -1
-    token_start: int = -1
-    token_end: int = -1
-    head_token: int = -1
+    semantic_type: str = ""
+    source_span: str = ""
+
+
+@dataclass
+class ASTEdge:
+    id: str
+    order: int
+    source: str
+    target: str
+    relation: str
+    surface: str = ""
+    direction: str = ""
+    confidence: float = 0.0
+
+
+@dataclass
+class ASTOperation:
+    id: str
+    operator: str
+    left: str = ""
+    right: str = ""
+    output: str = ""
+    description: str = ""
+
+
+@dataclass
+class QueryAST:
+    question: str
+    question_type: str
+    root_nodes: List[str]
+    answer_nodes: List[str]
+    nodes: List[ASTNode]
+    edges: List[ASTEdge]
+    operations: List[ASTOperation] = field(default_factory=list)
+    notes: str = ""
 
 
 @dataclass
 class AtomicQuestion:
+    edge_id: str
     question: str
-    input_var: Optional[str]
-    output_var: Optional[str]
+    input_binding: str = ""
+    output_binding: str = ""
+    depends_on: List[str] = field(default_factory=list)
 
 
 @dataclass
-class DecompositionResult:
+class OperationQuestion:
+    operation_id: str
     question: str
-    entities: List[EntityNode]
-    parse_result: ParseResult
-    query_ast: nx.Graph
-    entity_graph: nx.DiGraph
+    depends_on: List[str] = field(default_factory=list)
+
+
+@dataclass
+class Decomposition:
+    question: str
+    ast: QueryAST
     atomic_questions: List[AtomicQuestion]
-    trace: Dict[str, Any]
+    operation_questions: List[OperationQuestion]
+    model: str
 
 
-def detect_language(text: str) -> str:
-    zh_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
-    en_chars = len(re.findall(r"[A-Za-z]", text))
-    return "zh" if zh_chars > 0 and zh_chars >= en_chars / 2 else "en"
+class DecompositionError(RuntimeError):
+    pass
 
 
-def clean_json_text(text: str) -> str:
+def sanitize_id(value: str, prefix: str) -> str:
+    value = value.strip()
+    value = re.sub(r"[^A-Za-z0-9_]+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_").lower()
+    if not value:
+        value = prefix
+    if not re.match(r"^[A-Za-z_]", value):
+        value = f"{prefix}_{value}"
+    return value
+
+
+def as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def is_placeholder_ref(value: str) -> bool:
+    normalized = sanitize_id(value, "placeholder")
+    return normalized in {
+        "",
+        "none",
+        "null",
+        "nil",
+        "n_a",
+        "na",
+        "optional",
+        "optional_output",
+        "optional_output_node",
+        "optional_output_node_id",
+        "output_node_id",
+        "optional_node_id",
+        "not_applicable",
+    }
+
+
+def extract_json_object(text: str) -> Dict[str, Any]:
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
-    return text.strip()
+        text = text.strip()
 
-
-def extract_first_json_object(text: str) -> Dict[str, Any]:
-    text = clean_json_text(text)
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            raise ValueError("LLM did not return a JSON object.")
-        return json.loads(match.group(0))
-
-
-def normalize_for_match(text: str) -> Tuple[str, List[int]]:
-    kept_chars: List[str] = []
-    char_map: List[int] = []
-    for index, char in enumerate(text):
-        if re.match(r"[\u4e00-\u9fffA-Za-z0-9]", char):
-            kept_chars.append(char.lower())
-            char_map.append(index)
-    return "".join(kept_chars), char_map
-
-
-def find_span(text: str, needle: str, cursor: int = 0) -> Optional[Tuple[int, int]]:
-    needle = needle.strip()
-    if not needle:
-        return None
-
-    direct = text.find(needle, cursor)
-    if direct >= 0:
-        return direct, direct + len(needle)
-
-    lowered_text = text.lower()
-    lowered_needle = needle.lower()
-    lowered_direct = lowered_text.find(lowered_needle, cursor)
-    if lowered_direct >= 0:
-        return lowered_direct, lowered_direct + len(needle)
-
-    normalized_text, char_map = normalize_for_match(text)
-    normalized_needle, _ = normalize_for_match(needle)
-    if not normalized_needle:
-        return None
-
-    normalized_index = normalized_text.find(normalized_needle)
-    if normalized_index < 0:
-        return None
-
-    start_char = char_map[normalized_index]
-    end_char = char_map[normalized_index + len(normalized_needle) - 1] + 1
-    return start_char, end_char
-
-
-def map_span_to_tokens(
-    tokens: Sequence[TokenInfo], start_char: int, end_char: int
-) -> Tuple[int, int, int]:
-    covered = [
-        token.index
-        for token in tokens
-        if not (token.end_char <= start_char or token.start_char >= end_char)
-    ]
-    if not covered:
-        distances = [
-            (
-                min(
-                    abs(token.start_char - start_char),
-                    abs(token.end_char - end_char),
-                ),
-                token.index,
-            )
-            for token in tokens
-        ]
-        closest = min(distances)[1]
-        return closest, closest, closest
-
-    covered_set = set(covered)
-    span_roots = [idx for idx in covered if tokens[idx].head not in covered_set]
-    head_token = span_roots[0] if span_roots else covered[0]
-    return min(covered), max(covered), head_token
-
-
-def assign_entity_spans(question: str, parse_result: ParseResult, entities: List[EntityNode]) -> None:
-    cursor = 0
-    for entity in entities:
-        span = find_span(question, entity.text, cursor)
-        if span is None and entity.canonical != entity.text:
-            span = find_span(question, entity.canonical, cursor)
-        if span is None:
-            span = find_span(question, entity.text, 0)
-        if span is None and entity.canonical != entity.text:
-            span = find_span(question, entity.canonical, 0)
-        if span is None:
-            raise ValueError(f"Failed to align entity span: {entity.text}")
-
-        entity.mention_start, entity.mention_end = span
-        entity.token_start, entity.token_end, entity.head_token = map_span_to_tokens(
-            parse_result.tokens, entity.mention_start, entity.mention_end
-        )
-        cursor = entity.mention_end
-
-
-def build_dependency_graph(parse_result: ParseResult) -> nx.Graph:
-    graph = nx.Graph()
-    for token in parse_result.tokens:
-        graph.add_node(token.index)
-        if token.index != token.head:
-            graph.add_edge(token.index, token.head, dep=token.dep)
-    return graph
-
-
-def build_query_ast(parse_result: ParseResult, entities: Sequence[EntityNode]) -> nx.Graph:
-    """
-    Build the minimal token-level subtree that connects the parser root and the
-    entity head tokens.
-
-    The dependency parser returns a token tree. Each entity span is first
-    collapsed to its syntactic head token. We then keep the union of the
-    shortest dependency paths:
-    - root -> entity head
-    - consecutive entity head -> next entity head
-
-    The result is a minimal connected subtree that still preserves the query
-    chain. This subtree is the Query AST used as the bridge between syntax and
-    the later entity graph.
-    """
-
-    full_graph = build_dependency_graph(parse_result)
-    kept_nodes = {parse_result.root_index}
-
-    for entity in entities:
-        kept_nodes.update(nx.shortest_path(full_graph, parse_result.root_index, entity.head_token))
-
-    for left, right in zip(entities, entities[1:]):
-        kept_nodes.update(nx.shortest_path(full_graph, left.head_token, right.head_token))
-
-    return full_graph.subgraph(kept_nodes).copy()
-
-
-def extract_edge_evidence(
-    question: str,
-    parse_result: ParseResult,
-    left: EntityNode,
-    right: EntityNode,
-    path: Sequence[int],
-) -> Dict[str, Any]:
-    left_span = set(range(left.token_start, left.token_end + 1))
-    right_span = set(range(right.token_start, right.token_end + 1))
-    skipped = left_span | right_span
-
-    path_tokens = [parse_result.tokens[token_index].text for token_index in path]
-    path_labels = [parse_result.tokens[token_index].dep for token_index in path]
-    relation_tokens = [
-        parse_result.tokens[token_index].text
-        for token_index in path
-        if token_index not in skipped and parse_result.tokens[token_index].pos != "PUNCT"
-    ]
-
-    surface_start = min(left.mention_start, right.mention_start)
-    surface_end = max(left.mention_end, right.mention_end)
-    surface_span = question[surface_start:surface_end].strip(" ，,。？！?;；")
-
-    return {
-        "path_tokens": path_tokens,
-        "path_labels": path_labels,
-        "relation_tokens": relation_tokens,
-        "surface_span": surface_span,
-    }
-
-
-def build_entity_graph(
-    question: str,
-    parse_result: ParseResult,
-    entities: Sequence[EntityNode],
-    query_ast: nx.Graph,
-) -> nx.DiGraph:
-    """
-    Convert the token-level Query AST into an entity relation graph.
-
-    The AST still lives at token granularity, but Graph RAG needs semantic nodes.
-    We therefore collapse each entity span into one graph node and connect
-    consecutive entities in the semantic chain. The edge stores dependency-path
-    evidence extracted from the AST, so later one-hop question generation can
-    use real syntax instead of only surface order.
-    """
-
-    full_graph = build_dependency_graph(parse_result)
-    graph = nx.DiGraph()
-
-    for entity in entities:
-        graph.add_node(
-            entity.node_id,
-            text=entity.text,
-            canonical=entity.canonical,
-            kind=entity.kind,
-        )
-
-    for edge_order, (left, right) in enumerate(zip(entities, entities[1:]), start=1):
-        working_graph = query_ast
-        try:
-            path = nx.shortest_path(working_graph, left.head_token, right.head_token)
-        except nx.NetworkXNoPath:
-            path = nx.shortest_path(full_graph, left.head_token, right.head_token)
-
-        evidence = extract_edge_evidence(question, parse_result, left, right, path)
-        graph.add_edge(left.node_id, right.node_id, order=edge_order, **evidence)
-
-    return graph
-
-
-class DependencyParser:
-    def __init__(self) -> None:
-        self._cache: Dict[Tuple[str, str], Any] = {}
-
-    def parse(self, text: str, download_models: bool = False) -> ParseResult:
-        language = detect_language(text)
-        if download_models:
-            self.ensure_models(language)
-
-        spacy_result = self._parse_with_spacy(text, language)
-        if spacy_result is not None:
-            return spacy_result
-
-        stanza_result = self._parse_with_stanza(text, language)
-        if stanza_result is not None:
-            return stanza_result
-
-        raise RuntimeError(self.build_setup_error(language))
-
-    def ensure_models(self, language: str) -> None:
-        if importlib.util.find_spec("spacy") is not None:
-            try:
-                import spacy
-                from spacy.cli import download as spacy_download
-            except Exception:
-                pass
-            else:
-                if not any(spacy.util.is_package(name) for name in self._spacy_models_for_language(language)):
-                    spacy_download(self._spacy_models_for_language(language)[0])
-
-        if importlib.util.find_spec("stanza") is not None:
-            try:
-                import stanza
-            except Exception:
-                pass
-            else:
-                try:
-                    stanza.Pipeline(
-                        lang=language,
-                        processors="tokenize,pos,lemma,depparse",
-                        use_gpu=False,
-                        verbose=False,
-                    )
-                except Exception:
-                    stanza.download(language, processors="tokenize,pos,lemma,depparse", verbose=False)
-
-    def build_setup_error(self, language: str) -> str:
-        commands: List[str] = []
-        spacy_installed = importlib.util.find_spec("spacy") is not None
-        stanza_installed = importlib.util.find_spec("stanza") is not None
-
-        if not spacy_installed and not stanza_installed:
-            commands.append("pip install openai networkx spacy stanza")
-        else:
-            if not spacy_installed:
-                commands.append("pip install spacy")
-            if not stanza_installed:
-                commands.append("pip install stanza")
-
-        if spacy_installed and not self._has_any_spacy_model(language):
-            commands.append(f"python -m spacy download {self._spacy_models_for_language(language)[0]}")
-
-        if stanza_installed and not self._has_stanza_model(language):
-            commands.append(f"python -c \"import stanza; stanza.download('{language}')\"")
-
-        if not commands:
-            commands = [
-                "pip install -U spacy",
-                f"python -m spacy download {self._spacy_models_for_language(language)[0]}",
-                "pip install -U stanza",
-                f"python -c \"import stanza; stanza.download('{language}')\"",
-            ]
-
-        message = [
-            f"No dependency parser is available for language '{language}'.",
-            "Install one parser stack and rerun:",
-            *commands,
-            "Or rerun this script with --download-models after the parser package is installed.",
-        ]
-        return "\n".join(message)
-
-    @staticmethod
-    def _spacy_models_for_language(language: str) -> List[str]:
-        return ["zh_core_web_trf", "zh_core_web_sm"] if language == "zh" else ["en_core_web_trf", "en_core_web_sm"]
-
-    def _has_any_spacy_model(self, language: str) -> bool:
-        try:
-            import spacy
-        except Exception:
-            return False
-        return any(spacy.util.is_package(name) for name in self._spacy_models_for_language(language))
-
-    @staticmethod
-    def _has_stanza_model(language: str) -> bool:
-        resource_dir = os.getenv("STANZA_RESOURCES_DIR")
-        if not resource_dir:
-            resource_dir = str(Path.home() / "stanza_resources")
-        resources_path = Path(resource_dir) / "resources.json"
-        language_path = Path(resource_dir) / language
-        return resources_path.exists() and language_path.exists()
-
-    def _parse_with_spacy(self, text: str, language: str) -> Optional[ParseResult]:
-        try:
-            import spacy
-        except ImportError:
-            return None
-
-        model_candidates = (
-            ["zh_core_web_trf", "zh_core_web_sm", "en_core_web_trf", "en_core_web_sm"]
-            if language == "zh"
-            else ["en_core_web_trf", "en_core_web_sm", "zh_core_web_trf", "zh_core_web_sm"]
-        )
-
-        for model_name in model_candidates:
-            cache_key = ("spacy", model_name)
-            try:
-                if cache_key not in self._cache:
-                    self._cache[cache_key] = spacy.load(model_name)
-                nlp = self._cache[cache_key]
-                doc = nlp(text)
-            except OSError:
+        start = text.find("{")
+        if start < 0:
+            raise DecompositionError("Model response did not contain a JSON object.")
+        depth = 0
+        in_string = False
+        escape = False
+        end = -1
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
                 continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index + 1
+                    break
+        if end < 0:
+            raise DecompositionError("Model response contained incomplete JSON.")
+        parsed = json.loads(text[start:end])
 
-            tokens = [
-                TokenInfo(
-                    index=token.i,
-                    text=token.text,
-                    lemma=token.lemma_,
-                    pos=token.pos_,
-                    dep=token.dep_,
-                    head=token.head.i,
-                    start_char=token.idx,
-                    end_char=token.idx + len(token.text),
-                )
-                for token in doc
-            ]
-            root_index = next((token.i for token in doc if token.head == token), 0)
-            detected_language = "zh" if model_name.startswith("zh_") else "en"
-            return ParseResult(
-                language=detected_language,
-                backend=f"spacy:{model_name}",
-                tokens=tokens,
-                root_index=root_index,
+    if not isinstance(parsed, dict):
+        raise DecompositionError("Model response JSON must be an object.")
+    return parsed
+
+
+def read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+class ChatCompletionsJSONClient:
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str,
+        timeout: int = 90,
+        use_response_format: bool = True,
+        retries: int = 2,
+    ) -> None:
+        if not api_key:
+            raise DecompositionError(
+                "Missing API key. Pass --api-key or set OPENAI_API_KEY."
             )
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout = timeout
+        self.use_response_format = use_response_format
+        self.retries = retries
 
-        return None
+    @property
+    def endpoint(self) -> str:
+        if self.base_url.endswith("/chat/completions"):
+            return self.base_url
+        parsed = urllib.parse.urlparse(self.base_url)
+        if parsed.path in {"", "/"}:
+            return f"{self.base_url}/v1/chat/completions"
+        return f"{self.base_url}/chat/completions"
 
-    def _parse_with_stanza(self, text: str, language: str) -> Optional[ParseResult]:
-        try:
-            import stanza
-        except ImportError:
-            return None
+    def complete_json(self, system_prompt: str, user_prompt: str, purpose: str) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.0,
+        }
+        if self.use_response_format:
+            payload["response_format"] = {"type": "json_object"}
 
-        cache_key = ("stanza", language)
-        try:
-            if cache_key not in self._cache:
-                self._cache[cache_key] = stanza.Pipeline(
-                    lang=language,
-                    processors="tokenize,pos,lemma,depparse",
-                    use_gpu=False,
-                    verbose=False,
+        last_error: Optional[BaseException] = None
+        for attempt in range(self.retries + 1):
+            try:
+                return self._post_json(payload)
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                last_error = DecompositionError(
+                    f"{purpose} request failed with HTTP {exc.code}: {body}"
                 )
-            pipeline = self._cache[cache_key]
-            doc = pipeline(text)
-        except Exception:
-            return None
+                if (
+                    exc.code == 400
+                    and "response_format" in body
+                    and payload.pop("response_format", None) is not None
+                ):
+                    continue
+            except (urllib.error.URLError, TimeoutError, DecompositionError) as exc:
+                last_error = exc
 
-        tokens: List[TokenInfo] = []
-        roots: List[int] = []
+            if attempt < self.retries:
+                time.sleep(1.5 * (attempt + 1))
 
-        for sentence in doc.sentences:
-            words = sentence.words
-            base_index = len(tokens)
-            spans = self._get_stanza_spans(text, words, base_index, tokens)
+        raise DecompositionError(str(last_error))
 
-            for local_index, word in enumerate(words):
-                global_index = base_index + local_index
-                head_index = global_index if word.head == 0 else base_index + word.head - 1
-                if word.head == 0:
-                    roots.append(global_index)
-
-                start_char, end_char = spans[local_index]
-                tokens.append(
-                    TokenInfo(
-                        index=global_index,
-                        text=word.text,
-                        lemma=getattr(word, "lemma", word.text) or word.text,
-                        pos=getattr(word, "upos", "") or "",
-                        dep=getattr(word, "deprel", "") or "",
-                        head=head_index,
-                        start_char=start_char,
-                        end_char=end_char,
-                    )
-                )
-
-        if not tokens:
-            return None
-
-        return ParseResult(
-            language=language,
-            backend=f"stanza:{language}",
-            tokens=tokens,
-            root_index=roots[0] if roots else 0,
+    def _post_json(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            self.endpoint,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
         )
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+
+        try:
+            content = response_payload["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise DecompositionError(
+                f"Unexpected chat/completions response shape: {response_payload!r}"
+            ) from exc
+        return extract_json_object(content)
+
+
+class MockJSONClient:
+    """Deterministic local client for smoke tests without an API call."""
+
+    model = "mock-gpt-4o-mini"
+
+    def complete_json(self, system_prompt: str, user_prompt: str, purpose: str) -> Dict[str, Any]:
+        if purpose == "ast":
+            return self._mock_ast(user_prompt)
+        if purpose == "atomic":
+            return self._mock_atomic(user_prompt)
+        raise DecompositionError(f"Unknown mock purpose: {purpose}")
 
     @staticmethod
-    def _get_stanza_spans(
-        text: str,
-        words: Sequence[Any],
-        base_index: int,
-        existing_tokens: Sequence[TokenInfo],
-    ) -> List[Tuple[int, int]]:
-        spans: List[Tuple[int, int]] = []
-        cursor = existing_tokens[-1].end_char if existing_tokens else 0
+    def _mock_ast(question: str) -> Dict[str, Any]:
+        if "AlphaGo" in question:
+            return {
+                "question_type": "multi_hop",
+                "root_nodes": ["alphago"],
+                "answer_nodes": ["x_university", "x_city"],
+                "nodes": [
+                    {
+                        "id": "alphago",
+                        "label": "AlphaGo",
+                        "kind": "entity",
+                        "semantic_type": "AI_System",
+                        "source_span": "AlphaGo",
+                    },
+                    {
+                        "id": "x_company",
+                        "label": "artificial intelligence company",
+                        "kind": "type_variable",
+                        "semantic_type": "AI_Company",
+                        "source_span": "artificial intelligence company",
+                    },
+                    {
+                        "id": "x_ceo",
+                        "label": "CEO",
+                        "kind": "role_variable",
+                        "semantic_type": "Person",
+                        "source_span": "CEO",
+                    },
+                    {
+                        "id": "x_university",
+                        "label": "university",
+                        "kind": "type_variable",
+                        "semantic_type": "University",
+                        "source_span": "university",
+                    },
+                    {
+                        "id": "x_city",
+                        "label": "city",
+                        "kind": "type_variable",
+                        "semantic_type": "City",
+                        "source_span": "city",
+                    },
+                ],
+                "edges": [
+                    {
+                        "id": "e1",
+                        "order": 1,
+                        "source": "alphago",
+                        "target": "x_company",
+                        "relation": "developed_by",
+                        "surface": "company that developed AlphaGo",
+                        "direction": "start from AlphaGo and retrieve developer company",
+                        "confidence": 0.99,
+                    },
+                    {
+                        "id": "e2",
+                        "order": 2,
+                        "source": "x_company",
+                        "target": "x_ceo",
+                        "relation": "ceo_of",
+                        "surface": "CEO of the company",
+                        "direction": "retrieve CEO from company",
+                        "confidence": 0.99,
+                    },
+                    {
+                        "id": "e3",
+                        "order": 3,
+                        "source": "x_ceo",
+                        "target": "x_university",
+                        "relation": "graduated_from",
+                        "surface": "CEO graduate from university",
+                        "direction": "retrieve university from CEO",
+                        "confidence": 0.99,
+                    },
+                    {
+                        "id": "e4",
+                        "order": 4,
+                        "source": "x_university",
+                        "target": "x_city",
+                        "relation": "located_in",
+                        "surface": "university located in city",
+                        "direction": "retrieve city from university",
+                        "confidence": 0.99,
+                    },
+                ],
+                "operations": [],
+                "notes": "mock ast",
+            }
 
-        for word in words:
-            start_char = getattr(word, "start_char", None)
-            end_char = getattr(word, "end_char", None)
-            if start_char is None or end_char is None:
-                found = text.find(word.text, cursor)
-                if found < 0:
-                    found = text.find(word.text)
-                if found < 0:
-                    found = cursor
-                start_char = found
-                end_char = found + len(word.text)
-            spans.append((start_char, end_char))
-            cursor = end_char
+        if "Ten9Eight" in question or "Sabotage" in question:
+            return {
+                "question_type": "parallel",
+                "root_nodes": ["ten9eight", "sabotage_1936"],
+                "answer_nodes": ["x_nationality_1", "x_nationality_2"],
+                "nodes": [
+                    {
+                        "id": "ten9eight",
+                        "label": "Ten9Eight: Shoot For The Moon",
+                        "kind": "entity",
+                        "semantic_type": "Film",
+                        "source_span": "Ten9Eight: Shoot For The Moon",
+                    },
+                    {
+                        "id": "x_director_1",
+                        "label": "director",
+                        "kind": "role_variable",
+                        "semantic_type": "Person",
+                        "source_span": "director of film Ten9Eight: Shoot For The Moon",
+                    },
+                    {
+                        "id": "x_nationality_1",
+                        "label": "nationality",
+                        "kind": "value_variable",
+                        "semantic_type": "Nationality",
+                        "source_span": "nationality",
+                    },
+                    {
+                        "id": "sabotage_1936",
+                        "label": "Sabotage (1936 Film)",
+                        "kind": "entity",
+                        "semantic_type": "Film",
+                        "source_span": "Sabotage (1936 Film)",
+                    },
+                    {
+                        "id": "x_director_2",
+                        "label": "director",
+                        "kind": "role_variable",
+                        "semantic_type": "Person",
+                        "source_span": "director of film Sabotage (1936 Film)",
+                    },
+                    {
+                        "id": "x_nationality_2",
+                        "label": "nationality",
+                        "kind": "value_variable",
+                        "semantic_type": "Nationality",
+                        "source_span": "nationality",
+                    },
+                ],
+                "edges": [
+                    {
+                        "id": "e1",
+                        "order": 1,
+                        "source": "ten9eight",
+                        "target": "x_director_1",
+                        "relation": "directed_by",
+                        "surface": "director of film Ten9Eight",
+                        "direction": "retrieve director from film",
+                        "confidence": 0.99,
+                    },
+                    {
+                        "id": "e2",
+                        "order": 2,
+                        "source": "x_director_1",
+                        "target": "x_nationality_1",
+                        "relation": "has_nationality",
+                        "surface": "director nationality",
+                        "direction": "retrieve nationality from director",
+                        "confidence": 0.99,
+                    },
+                    {
+                        "id": "e3",
+                        "order": 3,
+                        "source": "sabotage_1936",
+                        "target": "x_director_2",
+                        "relation": "directed_by",
+                        "surface": "director of film Sabotage",
+                        "direction": "retrieve director from film",
+                        "confidence": 0.99,
+                    },
+                    {
+                        "id": "e4",
+                        "order": 4,
+                        "source": "x_director_2",
+                        "target": "x_nationality_2",
+                        "relation": "has_nationality",
+                        "surface": "director nationality",
+                        "direction": "retrieve nationality from director",
+                        "confidence": 0.99,
+                    },
+                ],
+                "operations": [
+                    {
+                        "id": "op1",
+                        "operator": "equals",
+                        "left": "x_nationality_1",
+                        "right": "x_nationality_2",
+                        "output": "",
+                        "description": "compare whether the two nationalities are the same",
+                    }
+                ],
+                "notes": "mock ast",
+            }
 
-        return spans
-
-
-class OpenAIJSONClient:
-    def __init__(self, api_key: str, base_url: str) -> None:
-        if not api_key or api_key == "YOUR_API_KEY":
-            raise RuntimeError("Please set OPENAI_API_KEY or edit OPENAI_API_KEY in the script.")
-
-        try:
-            from openai import OpenAI
-        except ImportError as exc:
-            raise RuntimeError("The 'openai' package is not installed. Run: pip install openai") from exc
-
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
-
-    def call_json(self, model: str, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
-        response = self.client.responses.create(
-            model=model,
-            input=[
+        return {
+            "question_type": "hybrid",
+            "root_nodes": ["question_context"],
+            "answer_nodes": ["x_answer"],
+            "nodes": [
                 {
-                    "role": "system",
-                    "content": [{"type": "input_text", "text": system_prompt}],
+                    "id": "question_context",
+                    "label": "question context",
+                    "kind": "entity",
+                    "semantic_type": "Context",
+                    "source_span": question[:80],
                 },
                 {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": user_prompt}],
+                    "id": "x_answer",
+                    "label": "answer",
+                    "kind": "type_variable",
+                    "semantic_type": "Answer",
+                    "source_span": "answer",
                 },
             ],
-        )
-        return extract_first_json_object(response.output_text)
-
-
-class GraphRAGDecomposer:
-    def __init__(self, llm: OpenAIJSONClient, parser: DependencyParser) -> None:
-        self.llm = llm
-        self.parser = parser
-
-    def extract_entities(self, question: str) -> Tuple[List[EntityNode], Dict[str, Any]]:
-        system_prompt = (
-            "You extract the semantic query chain for complex question decomposition.\n"
-            "Return JSON only.\n"
-            "Schema:\n"
-            "{\n"
-            '  "entities": [\n'
-            '    {"text": "...", "canonical": "...", "kind": "entity|type|role"}\n'
-            "  ]\n"
-            "}\n"
-            "Rules:\n"
-            "- Keep only the minimal set of nodes needed to answer the question.\n"
-            "- Order the nodes from the grounded starting entity to the final answer type.\n"
-            "- Preserve the original language of the question.\n"
-            "- Use short surface forms such as AlphaGo, CEO, university, city, 大学, 城市.\n"
-            "- 'entity' is a concrete named thing. 'role' is a role/title such as CEO. "
-            "'type' is a generic target category such as company, university, city.\n"
-            "- Do not include explanation."
-        )
-        user_prompt = f"Question:\n{question}"
-        payload = self.llm.call_json(ENTITY_MODEL, system_prompt, user_prompt)
-
-        raw_entities = payload.get("entities", [])
-        if not isinstance(raw_entities, list):
-            raise ValueError("Entity extraction returned an invalid JSON schema.")
-
-        entities: List[EntityNode] = []
-        seen: set[Tuple[str, str]] = set()
-        for index, item in enumerate(raw_entities, start=1):
-            if not isinstance(item, dict):
-                continue
-            text = str(item.get("text", "")).strip()
-            canonical = str(item.get("canonical", text)).strip() or text
-            kind = str(item.get("kind", "type")).strip().lower() or "type"
-            if not text:
-                continue
-            marker = (text, kind)
-            if marker in seen:
-                continue
-            seen.add(marker)
-            entities.append(
-                EntityNode(
-                    node_id=f"E{index}",
-                    text=text,
-                    canonical=canonical,
-                    kind=kind,
-                )
-            )
-
-        if len(entities) < 2:
-            raise ValueError("At least two ordered query nodes are required.")
-
-        return entities, payload
-
-    def generate_atomic_question(
-        self,
-        original_question: str,
-        source_entity: EntityNode,
-        target_entity: EntityNode,
-        edge_payload: Dict[str, Any],
-        subject_text: str,
-    ) -> Tuple[str, Dict[str, Any], bool]:
-        system_prompt = (
-            "You generate exactly one absolute atomic sub-question for one edge of a query graph.\n"
-            "Return JSON only: {\"question\": \"...\"}\n"
-            "Rules:\n"
-            "- Same language as the original question.\n"
-            "- Ask only for the next target node, never for any later hop.\n"
-            "- Use subject_text literally as the subject mention. If it is X/Y/Z, keep the placeholder unchanged.\n"
-            "- Keep the question short, direct, and answerable in one hop.\n"
-            "- Do not include explanation or options.\n"
-            "- Prefer natural phrasing such as '哪个人工智能公司研发了AlphaGo？', "
-            "'X的CEO是谁？', 'Y毕业于哪所大学？', 'Z位于哪座城市？'."
-        )
-        user_prompt = json.dumps(
-            {
-                "original_question": original_question,
-                "subject_text": subject_text,
-                "source_node": {
-                    "text": source_entity.text,
-                    "kind": source_entity.kind,
-                },
-                "target_node": {
-                    "text": target_entity.text,
-                    "kind": target_entity.kind,
-                },
-                "ast_evidence": edge_payload,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-
-        result = self.llm.call_json(QUESTION_MODEL, system_prompt, user_prompt)
-        question = str(result.get("question", "")).strip()
-        if question:
-            return question, result, False
-        return self._heuristic_atomic_question(
-            original_question, subject_text, target_entity.text, edge_payload
-        ), result, True
+            "edges": [
+                {
+                    "id": "e1",
+                    "order": 1,
+                    "source": "question_context",
+                    "target": "x_answer",
+                    "relation": "asks_for",
+                    "surface": question,
+                    "direction": "generic mock fallback",
+                    "confidence": 0.1,
+                }
+            ],
+            "operations": [],
+            "notes": "generic mock fallback",
+        }
 
     @staticmethod
-    def _heuristic_atomic_question(
-        original_question: str,
-        subject_text: str,
-        target_text: str,
-        edge_payload: Dict[str, Any],
-    ) -> str:
-        language = detect_language(original_question)
-        relation_text = "".join(edge_payload.get("relation_tokens", []))
-        surface_span = str(edge_payload.get("surface_span", ""))
-        evidence_text = f"{relation_text} {surface_span}".lower()
-
-        if language == "zh":
-            if "ceo" in evidence_text:
-                return f"{subject_text}的{target_text}是谁？"
-            if "毕业" in evidence_text:
-                return f"{subject_text}毕业于哪所大学？"
-            if "位于" in evidence_text or "城市" in target_text:
-                return f"{subject_text}位于哪座城市？"
-            if any(keyword in evidence_text for keyword in ("研发", "开发", "创造", "推出")):
-                return f"哪个{target_text}研发了{subject_text}？"
-            return f"与{subject_text}直接相关的{target_text}是什么？"
-
-        if "ceo" in evidence_text:
-            return f"Who is the CEO of {subject_text}?"
-        if "graduat" in evidence_text or "university" in target_text.lower():
-            return f"Which university did {subject_text} graduate from?"
-        if "city" in target_text.lower() or "locat" in evidence_text:
-            return f"Which city is {subject_text} located in?"
-        if any(keyword in evidence_text for keyword in ("develop", "create", "build", "invent")):
-            return f"Which {target_text} developed {subject_text}?"
-        return f"What {target_text} is directly related to {subject_text}?"
-
-    def decompose(
-        self, question: str, download_models: bool = False
-    ) -> DecompositionResult:
-        entities, entity_payload = self.extract_entities(question)
-        parse_result = self.parser.parse(question, download_models=download_models)
-        assign_entity_spans(question, parse_result, entities)
-        query_ast = build_query_ast(parse_result, entities)
-        entity_graph = build_entity_graph(question, parse_result, entities, query_ast)
-
-        atomic_questions: List[AtomicQuestion] = []
-        atomic_trace: List[Dict[str, Any]] = []
-        entity_by_id = {entity.node_id: entity for entity in entities}
-        current_subject = entities[0].text
-        current_input_var: Optional[str] = None
-        ordered_edges = sorted(entity_graph.edges(data=True), key=lambda item: item[2]["order"])
-
-        for edge_index, (source_id, target_id, edge_payload) in enumerate(ordered_edges):
-            source_entity = entity_by_id[source_id]
-            target_entity = entity_by_id[target_id]
-            output_var = (
-                PLACEHOLDER_POOL[edge_index] if edge_index < len(ordered_edges) - 1 else None
-            )
-            question_text, llm_output, used_heuristic = self.generate_atomic_question(
-                original_question=question,
-                source_entity=source_entity,
-                target_entity=target_entity,
-                edge_payload=edge_payload,
-                subject_text=current_subject,
-            )
+    def _mock_atomic(user_prompt: str) -> Dict[str, Any]:
+        payload = extract_json_object(user_prompt)
+        nodes = {node["id"]: node for node in payload["ast"]["nodes"]}
+        atomic_questions = []
+        for edge in payload["ast"]["edges"]:
+            source = nodes[edge["source"]]
+            target = nodes[edge["target"]]
+            source_text = source["id"] if source["kind"] != "entity" else source["label"]
+            relation = edge["relation"]
+            if relation == "developed_by":
+                question = f"Which {target['label']} developed {source_text}?"
+            elif relation == "ceo_of":
+                question = f"Who is the CEO of {source_text}?"
+            elif relation == "graduated_from":
+                question = f"Which university did {source_text} graduate from?"
+            elif relation == "located_in":
+                question = f"Which city is {source_text} located in?"
+            elif relation == "directed_by":
+                question = f"Who directed {source_text}?"
+            elif relation == "has_nationality":
+                question = f"What is the nationality of {source_text}?"
+            else:
+                question = f"What {target['label']} is related to {source_text} by {relation}?"
             atomic_questions.append(
-                AtomicQuestion(
-                    question=question_text,
-                    input_var=current_input_var,
-                    output_var=output_var,
-                )
-            )
-            atomic_trace.append(
                 {
-                    "step": edge_index + 1,
-                    "source_node": source_entity.text,
-                    "target_node": target_entity.text,
-                    "subject_text": current_subject,
-                    "input_var": current_input_var,
-                    "output_var": output_var,
-                    "edge_payload": edge_payload,
-                    "llm_output": llm_output,
-                    "used_heuristic_fallback": used_heuristic,
-                    "final_question": question_text,
+                    "edge_id": edge["id"],
+                    "question": question,
+                    "input_binding": source["id"] if source["kind"] != "entity" else "",
+                    "output_binding": target["id"] if target["kind"] != "entity" else "",
+                    "depends_on": _incoming_edge_ids(payload["ast"]["edges"], edge["source"]),
                 }
             )
-            if output_var is not None:
-                current_subject = output_var
-                current_input_var = output_var
 
-        return DecompositionResult(
-            question=question,
-            entities=entities,
-            parse_result=parse_result,
-            query_ast=query_ast,
-            entity_graph=entity_graph,
-            atomic_questions=atomic_questions,
-            trace={
-                "entity_extraction": {
-                    "model": ENTITY_MODEL,
-                    "llm_output": entity_payload,
-                },
-                "atomic_generation": {
-                    "model": QUESTION_MODEL,
-                    "steps": atomic_trace,
-                },
-            },
+        operation_questions = []
+        for operation in payload["ast"].get("operations", []):
+            operation_questions.append(
+                {
+                    "operation_id": operation["id"],
+                    "question": f"Do {operation.get('left', '')} and {operation.get('right', '')} satisfy {operation.get('operator', 'compare')}?",
+                    "depends_on": _incoming_edge_ids(
+                        payload["ast"]["edges"],
+                        operation.get("left", ""),
+                    )
+                    + _incoming_edge_ids(payload["ast"]["edges"], operation.get("right", "")),
+                }
+            )
+        return {
+            "atomic_questions": atomic_questions,
+            "operation_questions": operation_questions,
+        }
+
+
+def _incoming_edge_ids(edges: Sequence[Dict[str, Any]], target_node: str) -> List[str]:
+    return [str(edge.get("id", "")) for edge in edges if edge.get("target") == target_node]
+
+
+def build_query_ast(question: str, payload: Dict[str, Any]) -> QueryAST:
+    raw_nodes = as_list(payload.get("nodes"))
+    raw_edges = as_list(payload.get("edges"))
+    raw_operations = as_list(payload.get("operations"))
+
+    if len(raw_nodes) < 2:
+        raise DecompositionError("AST must contain at least two nodes.")
+    if not raw_edges:
+        raise DecompositionError("AST must contain at least one retrieval edge.")
+
+    nodes: List[ASTNode] = []
+    used_node_ids: Dict[str, int] = {}
+    original_to_clean: Dict[str, str] = {}
+
+    for index, raw_node in enumerate(raw_nodes, start=1):
+        if not isinstance(raw_node, dict):
+            continue
+        original_id = str(raw_node.get("id") or raw_node.get("label") or f"node_{index}")
+        clean_id = sanitize_id(original_id, f"n{index}")
+        if clean_id in used_node_ids:
+            used_node_ids[clean_id] += 1
+            clean_id = f"{clean_id}_{used_node_ids[clean_id]}"
+        else:
+            used_node_ids[clean_id] = 1
+        original_to_clean[original_id] = clean_id
+        nodes.append(
+            ASTNode(
+                id=clean_id,
+                label=str(raw_node.get("label") or original_id).strip(),
+                kind=normalize_kind(str(raw_node.get("kind", "type_variable"))),
+                semantic_type=str(raw_node.get("semantic_type", "")).strip(),
+                source_span=str(raw_node.get("source_span", "")).strip(),
+            )
         )
 
+    node_ids = {node.id for node in nodes}
+    if len(node_ids) < 2:
+        raise DecompositionError("AST node normalization produced fewer than two nodes.")
 
-def load_question_from_json(path: Path, index: int) -> str:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    edges: List[ASTEdge] = []
+    used_edge_ids: Dict[str, int] = {}
+    for index, raw_edge in enumerate(raw_edges, start=1):
+        if not isinstance(raw_edge, dict):
+            continue
+        source = remap_id(str(raw_edge.get("source", "")), original_to_clean)
+        target = remap_id(str(raw_edge.get("target", "")), original_to_clean)
+        if source not in node_ids or target not in node_ids:
+            raise DecompositionError(
+                f"Edge {raw_edge!r} references unknown source or target."
+            )
+        if source == target:
+            raise DecompositionError(f"Edge {raw_edge!r} has identical source and target.")
+
+        edge_id = sanitize_id(str(raw_edge.get("id") or f"e{index}"), f"e{index}")
+        if edge_id in used_edge_ids:
+            used_edge_ids[edge_id] += 1
+            edge_id = f"{edge_id}_{used_edge_ids[edge_id]}"
+        else:
+            used_edge_ids[edge_id] = 1
+
+        edges.append(
+            ASTEdge(
+                id=edge_id,
+                order=parse_int(raw_edge.get("order"), index),
+                source=source,
+                target=target,
+                relation=sanitize_id(str(raw_edge.get("relation", f"relation_{index}")), "relation"),
+                surface=str(raw_edge.get("surface", "")).strip(),
+                direction=str(raw_edge.get("direction", "")).strip(),
+                confidence=parse_float(raw_edge.get("confidence"), 0.0),
+            )
+        )
+
+    if not edges:
+        raise DecompositionError("No valid edges were found in AST.")
+
+    operations: List[ASTOperation] = []
+    for index, raw_operation in enumerate(raw_operations, start=1):
+        if not isinstance(raw_operation, dict):
+            continue
+        operations.append(
+            ASTOperation(
+                id=sanitize_id(str(raw_operation.get("id") or f"op{index}"), f"op{index}"),
+                operator=sanitize_id(
+                    str(raw_operation.get("operator", "compare")), "compare"
+                ),
+                left=remap_id(str(raw_operation.get("left", "")), original_to_clean),
+                right=remap_id(str(raw_operation.get("right", "")), original_to_clean),
+                output=remap_id(str(raw_operation.get("output", "")), original_to_clean),
+                description=str(raw_operation.get("description", "")).strip(),
+            )
+        )
+
+    validate_operations(operations, node_ids)
+    ordered_edges = order_edges(edges)
+
+    return QueryAST(
+        question=question,
+        question_type=normalize_question_type(str(payload.get("question_type", "hybrid"))),
+        root_nodes=[
+            remap_id(str(item), original_to_clean)
+            for item in as_list(payload.get("root_nodes"))
+            if remap_id(str(item), original_to_clean) in node_ids
+        ],
+        answer_nodes=[
+            remap_id(str(item), original_to_clean)
+            for item in as_list(payload.get("answer_nodes"))
+            if remap_id(str(item), original_to_clean) in node_ids
+        ],
+        nodes=nodes,
+        edges=ordered_edges,
+        operations=operations,
+        notes=str(payload.get("notes", "")).strip(),
+    )
+
+
+def remap_id(value: str, mapping: Dict[str, str]) -> str:
+    value = value.strip()
+    if not value or is_placeholder_ref(value):
+        return ""
+    return mapping.get(value, sanitize_id(value, "id"))
+
+
+def normalize_kind(value: str) -> str:
+    value = value.strip().lower()
+    allowed = {"entity", "type_variable", "role_variable", "value_variable"}
+    if value in allowed:
+        return value
+    if value in {"type", "variable"}:
+        return "type_variable"
+    if value in {"role"}:
+        return "role_variable"
+    if value in {"value", "attribute"}:
+        return "value_variable"
+    return "type_variable"
+
+
+def normalize_question_type(value: str) -> str:
+    value = value.strip().lower()
+    if value in {"multi_hop", "parallel", "hybrid"}:
+        return value
+    if value in {"multihop", "chain"}:
+        return "multi_hop"
+    return "hybrid"
+
+
+def parse_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def validate_operations(operations: Sequence[ASTOperation], node_ids: set[str]) -> None:
+    for operation in operations:
+        for field_name in ("left", "right", "output"):
+            value = getattr(operation, field_name)
+            if value and value not in node_ids:
+                raise DecompositionError(
+                    f"Operation {operation.id} references unknown {field_name}: {value}"
+                )
+
+
+def order_edges(edges: Sequence[ASTEdge]) -> List[ASTEdge]:
+    return sorted(edges, key=lambda edge: (edge.order, edge.id))
+
+
+def ast_to_payload(ast: QueryAST) -> Dict[str, Any]:
+    return {
+        "question": ast.question,
+        "question_type": ast.question_type,
+        "root_nodes": ast.root_nodes,
+        "answer_nodes": ast.answer_nodes,
+        "nodes": [asdict(node) for node in ast.nodes],
+        "edges": [asdict(edge) for edge in ast.edges],
+        "operations": [asdict(operation) for operation in ast.operations],
+        "notes": ast.notes,
+    }
+
+
+def generate_ast(client: Any, question: str) -> QueryAST:
+    user_prompt = f"Question:\n{question}"
+    payload = client.complete_json(AST_SYSTEM_PROMPT, user_prompt, purpose="ast")
+    return build_query_ast(question, payload)
+
+
+def generate_atomic_questions(client: Any, ast: QueryAST) -> Tuple[List[AtomicQuestion], List[OperationQuestion]]:
+    user_payload = {
+        "original_question": ast.question,
+        "ast": ast_to_payload(ast),
+        "edge_order": [edge.id for edge in ast.edges],
+    }
+    payload = client.complete_json(
+        ATOMIC_SYSTEM_PROMPT,
+        json.dumps(user_payload, ensure_ascii=False, indent=2),
+        purpose="atomic",
+    )
+
+    atomic_questions = parse_atomic_questions(payload, ast)
+    operation_questions = parse_operation_questions(payload, ast)
+    return atomic_questions, operation_questions
+
+
+def parse_atomic_questions(payload: Dict[str, Any], ast: QueryAST) -> List[AtomicQuestion]:
+    by_edge = {edge.id: edge for edge in ast.edges}
+    source_by_edge = {edge.id: edge.source for edge in ast.edges}
+    target_by_edge = {edge.id: edge.target for edge in ast.edges}
+    nodes = {node.id: node for node in ast.nodes}
+
+    raw_items = as_list(payload.get("atomic_questions"))
+    parsed_by_edge: Dict[str, AtomicQuestion] = {}
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            continue
+        edge_id = sanitize_id(str(raw_item.get("edge_id", "")), "edge")
+        if edge_id not in by_edge:
+            continue
+        question = str(raw_item.get("question", "")).strip()
+        if not question:
+            continue
+        edge = by_edge[edge_id]
+        source_node = nodes[source_by_edge[edge_id]]
+        target_node = nodes[target_by_edge[edge_id]]
+        parsed_by_edge[edge_id] = AtomicQuestion(
+            edge_id=edge_id,
+            question=question,
+            input_binding=str(raw_item.get("input_binding", "")).strip()
+            or (source_node.id if source_node.kind != "entity" else ""),
+            output_binding=str(raw_item.get("output_binding", "")).strip()
+            or (target_node.id if target_node.kind != "entity" else ""),
+            depends_on=[
+                sanitize_id(str(item), "edge")
+                for item in as_list(raw_item.get("depends_on"))
+                if sanitize_id(str(item), "edge") in by_edge
+            ],
+        )
+
+    ordered: List[AtomicQuestion] = []
+    for edge in ast.edges:
+        if edge.id in parsed_by_edge:
+            ordered.append(parsed_by_edge[edge.id])
+        else:
+            ordered.append(fallback_atomic_question(edge, nodes, ast.question))
+    return ordered
+
+
+def parse_operation_questions(payload: Dict[str, Any], ast: QueryAST) -> List[OperationQuestion]:
+    operation_ids = {operation.id for operation in ast.operations}
+    edge_ids = {edge.id for edge in ast.edges}
+    parsed: List[OperationQuestion] = []
+    for raw_item in as_list(payload.get("operation_questions")):
+        if not isinstance(raw_item, dict):
+            continue
+        operation_id = sanitize_id(str(raw_item.get("operation_id", "")), "op")
+        if operation_id not in operation_ids:
+            continue
+        question = str(raw_item.get("question", "")).strip()
+        if not question:
+            continue
+        parsed.append(
+            OperationQuestion(
+                operation_id=operation_id,
+                question=question,
+                depends_on=[
+                    sanitize_id(str(item), "edge")
+                    for item in as_list(raw_item.get("depends_on"))
+                    if sanitize_id(str(item), "edge") in edge_ids
+                ],
+            )
+        )
+
+    existing_ids = {item.operation_id for item in parsed}
+    for operation in ast.operations:
+        if operation.id not in existing_ids:
+            parsed.append(fallback_operation_question(operation, ast.edges))
+    return parsed
+
+
+def fallback_atomic_question(edge: ASTEdge, nodes: Dict[str, ASTNode], original_question: str) -> AtomicQuestion:
+    source = nodes[edge.source]
+    target = nodes[edge.target]
+    source_text = source.label if source.kind == "entity" else source.id
+    target_text = target.semantic_type or target.label
+    relation = edge.relation
+
+    if uses_chinese(original_question):
+        if relation in {"ceo_of", "has_ceo"}:
+            question = f"{source_text}的CEO是谁？"
+        elif relation in {"graduated_from", "graduate_from"}:
+            question = f"{source_text}毕业于哪所大学？"
+        elif relation in {"located_in", "location"}:
+            question = f"{source_text}位于哪座城市？"
+        elif relation in {"developed_by", "created_by"}:
+            question = f"哪个{target_text}研发了{source_text}？"
+        elif relation in {"directed_by"}:
+            question = f"谁导演了{source_text}？"
+        elif relation in {"has_nationality", "nationality"}:
+            question = f"{source_text}的国籍是什么？"
+        else:
+            question = f"与{source_text}通过{relation}关系相连的{target_text}是什么？"
+    else:
+        if relation in {"ceo_of", "has_ceo"}:
+            question = f"Who is the CEO of {source_text}?"
+        elif relation in {"graduated_from", "graduate_from"}:
+            question = f"Which university did {source_text} graduate from?"
+        elif relation in {"located_in", "location"}:
+            question = f"Which city is {source_text} located in?"
+        elif relation in {"developed_by", "created_by"}:
+            question = f"Which {target_text} developed {source_text}?"
+        elif relation in {"directed_by"}:
+            question = f"Who directed {source_text}?"
+        elif relation in {"has_nationality", "nationality"}:
+            question = f"What is the nationality of {source_text}?"
+        else:
+            question = f"What {target_text} is connected to {source_text} by {relation}?"
+
+    return AtomicQuestion(
+        edge_id=edge.id,
+        question=question,
+        input_binding=source.id if source.kind != "entity" else "",
+        output_binding=target.id if target.kind != "entity" else "",
+        depends_on=[],
+    )
+
+
+def fallback_operation_question(operation: ASTOperation, edges: Sequence[ASTEdge]) -> OperationQuestion:
+    depends_on = [
+        edge.id
+        for edge in edges
+        if edge.target in {operation.left, operation.right, operation.output}
+    ]
+    return OperationQuestion(
+        operation_id=operation.id,
+        question=f"Check whether {operation.left} and {operation.right} satisfy {operation.operator}.",
+        depends_on=depends_on,
+    )
+
+
+def uses_chinese(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text))
+
+
+def decompose_question(client: Any, question: str, model: str) -> Decomposition:
+    ast = generate_ast(client, question)
+    atomic_questions, operation_questions = generate_atomic_questions(client, ast)
+    return Decomposition(
+        question=question,
+        ast=ast,
+        atomic_questions=atomic_questions,
+        operation_questions=operation_questions,
+        model=model,
+    )
+
+
+def load_questions(path: Path) -> List[str]:
+    data = read_json(path)
     if not isinstance(data, list):
-        raise ValueError("Question file must contain a JSON array.")
-    if not 0 <= index < len(data):
-        raise IndexError(f"Question index {index} is out of range for {path}.")
+        raise DecompositionError("Question file must contain a JSON array.")
 
-    item = data[index]
-    if isinstance(item, str):
-        return item
-    if isinstance(item, dict):
-        for key in ("question", "query", "text"):
-            if key in item:
-                return str(item[key])
-    raise ValueError(f"Unsupported question record at index {index}: {item!r}")
+    questions: List[str] = []
+    for index, item in enumerate(data):
+        if isinstance(item, str):
+            question = item.strip()
+        elif isinstance(item, dict):
+            question = ""
+            for key in ("question", "query", "text"):
+                if key in item:
+                    question = str(item[key]).strip()
+                    break
+        else:
+            question = ""
+
+        if not question:
+            raise DecompositionError(f"Unsupported question record at index {index}: {item!r}")
+        questions.append(question)
+    return questions
 
 
-def resolve_question(args: argparse.Namespace) -> Tuple[str, Dict[str, Any]]:
+def resolve_questions(args: argparse.Namespace) -> List[Tuple[int, str]]:
     if args.question:
-        return args.question.strip(), {"mode": "custom_input"}
+        return [(-1, args.question.strip())]
 
-    file_path = Path(args.question_file) if args.question_file else Path(DEFAULT_QUESTION_FILE)
-    if file_path.exists():
-        return load_question_from_json(file_path, args.index), {
-            "mode": "question_file",
-            "path": str(file_path.resolve()),
-            "index": args.index,
-        }
+    if args.stdin:
+        question = sys.stdin.read().strip()
+        if not question:
+            raise DecompositionError("--stdin was used but stdin is empty.")
+        return [(-1, question)]
 
-    return DEFAULT_SAMPLE_QUESTION, {"mode": "default_sample"}
+    question_file = Path(args.question_file)
+    if not question_file.exists():
+        raise DecompositionError(
+            f"Question file not found: {question_file}. Pass --question for custom input."
+        )
 
+    questions = load_questions(question_file)
+    if args.all:
+        indexed = list(enumerate(questions))
+        if args.limit is not None:
+            indexed = indexed[: args.limit]
+        return indexed
 
-def serialize_tokens(tokens: Sequence[TokenInfo]) -> List[Dict[str, Any]]:
-    return [
-        {
-            "index": token.index,
-            "text": token.text,
-            "lemma": token.lemma,
-            "pos": token.pos,
-            "dep": token.dep,
-            "head": token.head,
-            "start_char": token.start_char,
-            "end_char": token.end_char,
-        }
-        for token in tokens
-    ]
-
-
-def serialize_entities(entities: Sequence[EntityNode]) -> List[Dict[str, Any]]:
-    return [
-        {
-            "node_id": entity.node_id,
-            "text": entity.text,
-            "canonical": entity.canonical,
-            "kind": entity.kind,
-            "mention_start": entity.mention_start,
-            "mention_end": entity.mention_end,
-            "token_start": entity.token_start,
-            "token_end": entity.token_end,
-            "head_token": entity.head_token,
-        }
-        for entity in entities
-    ]
+    if args.index < 0 or args.index >= len(questions):
+        raise DecompositionError(
+            f"--index {args.index} is out of range. {question_file} contains {len(questions)} questions."
+        )
+    return [(args.index, questions[args.index])]
 
 
-def serialize_query_ast(query_ast: nx.Graph, parse_result: ParseResult) -> Dict[str, Any]:
-    token_map = {token.index: token for token in parse_result.tokens}
-    ordered_nodes = sorted(query_ast.nodes())
-    ordered_edges = sorted(query_ast.edges(data=True), key=lambda item: (min(item[0], item[1]), max(item[0], item[1])))
+def decomposition_to_dict(item: Decomposition, source_index: int) -> Dict[str, Any]:
     return {
-        "nodes": [
-            {
-                "token_index": token_index,
-                "text": token_map[token_index].text,
-                "dep": token_map[token_index].dep,
-                "head": token_map[token_index].head,
-            }
-            for token_index in ordered_nodes
-        ],
-        "edges": [
-            {
-                "source": source,
-                "target": target,
-                "dep": edge_data.get("dep", ""),
-            }
-            for source, target, edge_data in ordered_edges
-        ],
+        "source_index": source_index,
+        "question": item.question,
+        "model": item.model,
+        "query_ast": ast_to_payload(item.ast),
+        "atomic_questions": [asdict(question) for question in item.atomic_questions],
+        "operation_questions": [asdict(question) for question in item.operation_questions],
     }
 
 
-def serialize_entity_graph(entity_graph: nx.DiGraph) -> Dict[str, Any]:
-    ordered_edges = sorted(entity_graph.edges(data=True), key=lambda item: item[2]["order"])
-    return {
-        "nodes": [
-            {
-                "node_id": node_id,
-                **node_data,
-            }
-            for node_id, node_data in entity_graph.nodes(data=True)
-        ],
-        "edges": [
-            {
-                "source": source,
-                "target": target,
-                **edge_data,
-            }
-            for source, target, edge_data in ordered_edges
-        ],
-    }
+def render_decomposition(item: Decomposition, source_index: int) -> str:
+    lines: List[str] = []
+    index_text = "custom" if source_index < 0 else str(source_index)
+    node_map = {node.id: node for node in item.ast.nodes}
+
+    lines.append(f"问题索引: {index_text}")
+    lines.append(f"原问题: {item.question}")
+    lines.append(f"问题类型: {item.ast.question_type}")
+    lines.append("")
+    lines.append("实体/类型变量节点:")
+    for node in item.ast.nodes:
+        type_text = f": {node.semantic_type}" if node.semantic_type else ""
+        lines.append(f"  - {node.id} = {node.label} [{node.kind}{type_text}]")
+
+    lines.append("")
+    lines.append("语法树 / Query AST 一跳边:")
+    for edge in item.ast.edges:
+        source = node_map[edge.source]
+        target = node_map[edge.target]
+        source_text = format_node_for_edge(source)
+        target_text = format_node_for_edge(target)
+        surface = f"  surface={edge.surface}" if edge.surface else ""
+        lines.append(f"  - ({edge.id}) {source_text} --{edge.relation}--> {target_text}{surface}")
+
+    if item.ast.operations:
+        lines.append("")
+        lines.append("操作节点:")
+        for operation in item.ast.operations:
+            right = f", {operation.right}" if operation.right else ""
+            lines.append(f"  - ({operation.id}) {operation.operator}({operation.left}{right})")
+
+    lines.append("")
+    lines.append("原子子问题:")
+    for index, question in enumerate(item.atomic_questions, start=1):
+        binding = render_binding(question.input_binding, question.output_binding)
+        lines.append(f"  {index}. [{question.edge_id}{binding}] {question.question}")
+
+    if item.operation_questions:
+        lines.append("")
+        lines.append("非检索操作问题:")
+        for index, question in enumerate(item.operation_questions, start=1):
+            deps = f" depends_on={','.join(question.depends_on)}" if question.depends_on else ""
+            lines.append(f"  {index}. [{question.operation_id}{deps}] {question.question}")
+
+    return "\n".join(lines)
 
 
-def serialize_atomic_questions(atomic_questions: Sequence[AtomicQuestion]) -> List[Dict[str, Any]]:
-    return [
-        {
-            "step": index,
-            "question": item.question,
-            "input_var": item.input_var,
-            "output_var": item.output_var,
-        }
-        for index, item in enumerate(atomic_questions, start=1)
-    ]
+def format_node_for_edge(node: ASTNode) -> str:
+    if node.kind == "entity":
+        return node.label
+    if node.semantic_type:
+        return f"{node.id}: {node.semantic_type}"
+    return f"{node.id}: {node.label}"
 
 
-def build_log_payload(
-    args: argparse.Namespace,
-    question: str,
-    source_info: Dict[str, Any],
-    result: Optional[DecompositionResult] = None,
-    error: Optional[BaseException] = None,
-) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "status": "success" if error is None else "error",
-        "question": question,
-        "source": source_info,
-        "configuration": {
-            "entity_model": ENTITY_MODEL,
-            "question_model": QUESTION_MODEL,
-            "base_url": args.base_url,
-            "download_models": bool(args.download_models),
-        },
-    }
-
-    if result is not None:
-        payload["decomposition"] = {
-            "parser": {
-                "language": result.parse_result.language,
-                "backend": result.parse_result.backend,
-                "root_index": result.parse_result.root_index,
-            },
-            "tokens": serialize_tokens(result.parse_result.tokens),
-            "entities": serialize_entities(result.entities),
-            "query_ast": serialize_query_ast(result.query_ast, result.parse_result),
-            "entity_graph": serialize_entity_graph(result.entity_graph),
-            "atomic_questions": serialize_atomic_questions(result.atomic_questions),
-            "trace": result.trace,
-        }
-
-    if error is not None:
-        payload["error"] = {
-            "type": error.__class__.__name__,
-            "message": str(error),
-            "traceback": traceback.format_exc(),
-        }
-
-    return payload
+def render_binding(input_binding: str, output_binding: str) -> str:
+    parts: List[str] = []
+    if input_binding:
+        parts.append(f"input={input_binding}")
+    if output_binding:
+        parts.append(f"output={output_binding}")
+    if not parts:
+        return ""
+    return "; " + "; ".join(parts)
 
 
-def write_log_file(log_dir: Path, payload: Dict[str, Any]) -> Path:
-    log_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    status = payload.get("status", "success")
-    file_path = log_dir / f"{timestamp}_{status}.json"
-    file_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return file_path
+def build_client(args: argparse.Namespace) -> Any:
+    if args.mock:
+        return MockJSONClient()
+    api_key = args.api_key or os.getenv("OPENAI_API_KEY", "")
+    return ChatCompletionsJSONClient(
+        api_key=api_key,
+        base_url=args.base_url,
+        model=args.model,
+        timeout=args.timeout,
+        use_response_format=not args.no_response_format,
+        retries=args.retries,
+    )
 
 
-def render_graph_text(graph: nx.DiGraph) -> str:
-    ordered_edges = sorted(graph.edges(data=True), key=lambda item: item[2]["order"])
-    parts = [f"{graph.nodes[source]['text']} -> {graph.nodes[target]['text']}" for source, target, _ in ordered_edges]
-    return ", ".join(parts)
-
-
-def render_atomic_question_line(index: int, item: AtomicQuestion) -> str:
-    markers: List[str] = []
-    if item.input_var:
-        markers.append(f"输入={item.input_var}")
-    if item.output_var:
-        markers.append(f"输出={item.output_var}")
-    marker_text = f" [{', '.join(markers)}]" if markers else ""
-    return f"Q{index}{marker_text} {item.question}"
-
-
-def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Dependency-tree + Graph-RAG question decomposer")
-    parser.add_argument("--question", type=str, default=None, help="Custom input question.")
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate a Query AST and one-hop atomic sub-questions for Graph-RAG."
+    )
+    parser.add_argument("--question", type=str, help="Custom complex question.")
+    parser.add_argument(
+        "--stdin",
+        action="store_true",
+        help="Read one custom question from stdin.",
+    )
     parser.add_argument(
         "--question-file",
         type=str,
-        default=None,
-        help=f"JSON file path. Defaults to {DEFAULT_QUESTION_FILE} when the file exists.",
+        default=DEFAULT_QUESTION_FILE,
+        help=f"JSON question file. Default: {DEFAULT_QUESTION_FILE}",
     )
-    parser.add_argument("--index", type=int, default=0, help="Question index in the JSON array.")
-    parser.add_argument("--api-key", type=str, default=OPENAI_API_KEY, help="OpenAI API key.")
-    parser.add_argument("--base-url", type=str, default=OPENAI_BASE_URL, help="OpenAI base URL.")
+    parser.add_argument("--index", type=int, default=0, help="Question index in question file.")
+    parser.add_argument("--all", action="store_true", help="Process all questions in the file.")
+    parser.add_argument("--limit", type=int, help="Limit number of questions when --all is used.")
+    parser.add_argument("--api-key", type=str, default=os.getenv("OPENAI_API_KEY", ""))
+    parser.add_argument("--base-url", type=str, default=DEFAULT_BASE_URL)
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
+    parser.add_argument("--timeout", type=int, default=90)
+    parser.add_argument("--retries", type=int, default=2)
     parser.add_argument(
-        "--download-models",
+        "--no-response-format",
         action="store_true",
-        help="Attempt to download missing spaCy/stanza parser models before running.",
+        help="Disable response_format=json_object for providers that do not support it.",
     )
     parser.add_argument(
-        "--log-dir",
-        type=str,
-        default="decomposition_logs",
-        help="Directory for per-run JSON logs.",
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format.",
     )
+    parser.add_argument("--output", type=str, help="Write full JSON results to this path.")
     parser.add_argument(
-        "--no-log",
+        "--mock",
         action="store_true",
-        help="Disable log file generation.",
+        help="Run deterministic local smoke test without calling the API.",
     )
     return parser
 
 
-def main() -> None:
-    args = build_argument_parser().parse_args()
-    log_dir = Path(args.log_dir)
-    question = ""
-    source_info: Dict[str, Any] = {"mode": "unresolved"}
-    result: Optional[DecompositionResult] = None
+def main() -> int:
+    args = build_arg_parser().parse_args()
+    client = build_client(args)
+    model = getattr(client, "model", args.model)
+    questions = resolve_questions(args)
 
-    try:
-        question, source_info = resolve_question(args)
-        llm = OpenAIJSONClient(api_key=args.api_key, base_url=args.base_url)
-        parser = DependencyParser()
-        decomposer = GraphRAGDecomposer(llm=llm, parser=parser)
-        result = decomposer.decompose(question, download_models=args.download_models)
-        if not args.no_log:
-            write_log_file(log_dir, build_log_payload(args, question, source_info, result=result))
+    results: List[Dict[str, Any]] = []
+    text_blocks: List[str] = []
 
-        print(f"1. 原问题：{question}")
-        print(f"2. 查询实体关系图：{render_graph_text(result.entity_graph)}")
-        print("3. 分解后的子问题：")
-        for index, item in enumerate(result.atomic_questions, start=1):
-            print(render_atomic_question_line(index, item))
-    except Exception as exc:
-        if not args.no_log:
-            write_log_file(log_dir, build_log_payload(args, question, source_info, result=result, error=exc))
-        raise
+    for source_index, question in questions:
+        decomposition = decompose_question(client, question, model=model)
+        results.append(decomposition_to_dict(decomposition, source_index))
+        text_blocks.append(render_decomposition(decomposition, source_index))
+
+    payload = {
+        "model": model,
+        "base_url": "mock" if args.mock else args.base_url,
+        "count": len(results),
+        "results": results,
+    }
+
+    if args.output:
+        write_json(Path(args.output), payload)
+
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print("\n\n".join(text_blocks))
+        if args.output:
+            print(f"\n完整 JSON 已写入: {Path(args.output).resolve()}")
+
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
-    except Exception as exc:
-        print(str(exc), file=sys.stderr)
-        sys.exit(1)
+        raise SystemExit(main())
+    except DecompositionError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
