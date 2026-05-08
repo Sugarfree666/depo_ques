@@ -2,158 +2,213 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
+import os
 import sys
+from typing import Any
 
-from hypergraph_rag import (
-    DEFAULT_BASE_URL,
-    DEFAULT_MODEL,
-    MockLLMClient,
-    QuestionRecord,
-    QueryDecomposer,
-    build_client,
-    load_question_records,
-    render_console_result,
-    result_to_dict,
-)
-from hypergraph_rag.io_utils import write_json
-from hypergraph_rag.parsing import DEFAULT_SPACY_MODEL
+from io_utils import read_questions
+from models import ASTResult, AtomicSubquestion, ExtractionResult, PlaceholderReplacement, QuestionRecord
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Decompose complex questions into a typed query graph and atomic sub-questions."
+        description="DEPO one-hop atomic subquestion decomposition using entity/type-variable relation graphs."
     )
-    parser.add_argument(
-        "--question",
-        type=str,
-        help="Process one custom question from the command line.",
-    )
-    parser.add_argument(
-        "--question-id",
-        type=str,
-        help="Optional question id when --question is used.",
-    )
-    parser.add_argument(
-        "--questions-file",
-        type=str,
-        default="questions.json",
-        help="Path to a JSON file containing batch questions.",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        help="Optional batch limit when reading from --questions-file.",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        help="Optional path to write full structured JSON output.",
-    )
-    parser.add_argument(
-        "--api-key",
-        type=str,
-        help="OpenAI-compatible API key. Defaults to OPENAI_API_KEY.",
-    )
-    parser.add_argument(
-        "--base-url",
-        type=str,
-        default=DEFAULT_BASE_URL,
-        help="OpenAI-compatible base URL. Defaults to OPENAI_BASE_URL or the OpenAI API.",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=DEFAULT_MODEL,
-        help="Model name. Defaults to gpt-4o-mini.",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=90,
-        help="HTTP timeout in seconds for the OpenAI-compatible client.",
-    )
-    parser.add_argument(
-        "--retries",
-        type=int,
-        default=2,
-        help="Retry count for transient API failures.",
-    )
-    parser.add_argument(
-        "--spacy-model",
-        type=str,
-        default=DEFAULT_SPACY_MODEL,
-        help="spaCy model name for auxiliary dependency parsing.",
-    )
-    parser.add_argument(
-        "--mock",
-        action="store_true",
-        help="Use the built-in mock client for the two reference example questions.",
-    )
-    return parser
+    parser.add_argument("--question", help="Run one manually supplied question instead of questions.json.")
+    parser.add_argument("--questions-file", default="questions.json", help="Path to questions.json.")
+    parser.add_argument("--api-key", help="OpenAI API key. Used only if OPENAI_API_KEY is not set.")
+    parser.add_argument("--base-url", help="OpenAI base URL. Used only if OPENAI_BASE_URL is not set.")
+    parser.add_argument("--corenlp-url", default="http://localhost:9000", help="Stanford CoreNLP server URL.")
+    parser.add_argument("--debug", action="store_true", help="Print additional intermediate structures.")
+    return parser.parse_args()
 
 
 def main() -> int:
-    args = build_arg_parser().parse_args()
+    args = parse_args()
+    api_key = os.getenv("OPENAI_API_KEY") or args.api_key
+    base_url = os.getenv("OPENAI_BASE_URL") or args.base_url
+    if not api_key:
+        print("Missing API key. Set OPENAI_API_KEY or pass --api-key.", file=sys.stderr)
+        return 2
 
-    if args.mock:
-        client = MockLLMClient()
-    else:
-        client = build_client(
-            api_key=args.api_key,
-            base_url=args.base_url,
-            model=args.model,
-            timeout=args.timeout,
-            retries=args.retries,
-        )
+    records = [QuestionRecord(question=args.question)] if args.question else read_questions(args.questions_file)
 
-    decomposer = QueryDecomposer(client=client, spacy_model=args.spacy_model)
+    try:
+        from ast_builder import ASTBuilder
+        from corenlp_parser import CoreNLPConnectionError, CoreNLPParser
+        from entity_extractor import EntityExtractor
+        from graph_builder import AnchorGraphError, GraphBuilder
+        from llm_client import LLMClient
+        from subquestion_generator import SubquestionGenerator
 
-    records = _resolve_records(args)
-    payload_results: list[dict] = []
-    console_blocks: list[str] = []
+        llm_client = LLMClient(api_key=api_key, base_url=base_url, model="gpt-4o-mini")
+        extractor = EntityExtractor(llm_client)
+        parser = CoreNLPParser(args.corenlp_url)
+        graph_builder = GraphBuilder()
+        ast_builder = ASTBuilder(llm_client)
+        subquestion_generator = SubquestionGenerator(llm_client)
 
-    for record in records:
-        result, graph = decomposer.decompose_question(
-            record.question,
-            question_id=record.question_id,
-        )
-        payload_results.append(result_to_dict(result, graph))
-        console_blocks.append(render_console_result(result, graph))
-
-    print("\n\n".join(console_blocks))
-
-    if args.output:
-        payload = {
-            "model": getattr(client, "model", args.model),
-            "base_url": "mock" if args.mock else args.base_url,
-            "result_count": len(payload_results),
-            "results": payload_results,
-        }
-        write_json(args.output, payload)
-        print(f"\nStructured JSON written to: {Path(args.output).resolve()}")
+        for index, record in enumerate(records, start=1):
+            result = run_pipeline(
+                record=record,
+                index=index,
+                extractor=extractor,
+                parser=parser,
+                graph_builder=graph_builder,
+                ast_builder=ast_builder,
+                subquestion_generator=subquestion_generator,
+                debug=args.debug,
+            )
+            print_result(index, record, result, debug=args.debug)
+    except ModuleNotFoundError as exc:
+        print(f"Missing dependency: {exc.name}. Run: pip install -r requirements.txt", file=sys.stderr)
+        return 2
+    except (CoreNLPConnectionError, AnchorGraphError, RuntimeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
     return 0
 
 
-def _resolve_records(args: argparse.Namespace):
-    if args.question:
-        return [
-            QuestionRecord(
-                question=args.question.strip(),
-                question_id=args.question_id or None,
-            )
-        ]
+def run_pipeline(
+    record: QuestionRecord,
+    index: int,
+    extractor: EntityExtractor,
+    parser: CoreNLPParser,
+    graph_builder: GraphBuilder,
+    ast_builder: ASTBuilder,
+    subquestion_generator: SubquestionGenerator,
+    debug: bool = False,
+) -> dict[str, Any]:
+    from placeholder import replace_with_placeholders
 
-    records = load_question_records(args.questions_file)
-    if args.limit is not None:
-        return records[: args.limit]
-    return records
+    extraction = extractor.extract(record.question)
+    replacement = replace_with_placeholders(record.question, extraction)
+    dependency_parse = parser.parse(replacement.question)
+    anchor_graph = graph_builder.build_anchor_graph(dependency_parse, extraction)
+    ast = ast_builder.build(record.question, extraction, replacement, anchor_graph)
+    subquestions = subquestion_generator.generate(record.question, ast, extraction)
+    return {
+        "extraction": extraction,
+        "replacement": replacement,
+        "dependency_parse": dependency_parse,
+        "anchor_graph": anchor_graph,
+        "ast": ast,
+        "subquestions": subquestions,
+    }
+
+
+def print_result(index: int, record: QuestionRecord, result: dict[str, Any], debug: bool = False) -> None:
+    from graph_builder import format_dependency_edges, format_graph_lines
+
+    extraction: ExtractionResult = result["extraction"]
+    replacement: PlaceholderReplacement = result["replacement"]
+    dependency_parse = result["dependency_parse"]
+    anchor_graph = result["anchor_graph"]
+    ast: ASTResult = result["ast"]
+    subquestions: list[AtomicSubquestion] = result["subquestions"]
+
+    separator = "=" * 60
+    print(separator)
+    title = f"Question {index}"
+    if record.qid:
+        title += f" ({record.qid})"
+    print(title)
+    print(separator)
+    print()
+
+    print("[Original Question]")
+    print(record.question)
+    print()
+
+    print("[1. Entities and Type Variables]")
+    print("Entities:")
+    _print_nodes(extraction.entities)
+    print()
+    print("Type Variables:")
+    _print_nodes(extraction.type_variables)
+    print()
+
+    print("[2. Placeholder Question]")
+    print(replacement.question)
+    print()
+    print("Placeholder Mapping:")
+    for placeholder, text in replacement.mapping.items():
+        print(f"  - {placeholder}: {text}")
+    print()
+
+    print("[3. Dependency Graph: Enhanced++]")
+    print("Edges:")
+    edge_lines = format_dependency_edges(dependency_parse)
+    if edge_lines:
+        for line in edge_lines:
+            print(line)
+    else:
+        print("  (no dependency edges)")
+    print()
+
+    print("[4. Anchor MST / Anchor Graph]")
+    entity_nodes = [node.placeholder for node in extraction.entities]
+    for line in format_graph_lines(anchor_graph.graph, entity_nodes=entity_nodes):
+        print(line)
+    print()
+
+    print("[5. Final AST]")
+    operator_nodes = [
+        node for node, attrs in ast.graph.nodes(data=True) if attrs.get("kind") == "operator"
+    ]
+    for line in format_graph_lines(
+        ast.graph,
+        label_func=ast.display_label,
+        entity_nodes=entity_nodes,
+        operator_nodes=operator_nodes,
+    ):
+        print(line)
+    print()
+    print("Operators:")
+    if ast.operators:
+        for operator in ast.operators:
+            attach = f" (attach_to: {', '.join(operator.attach_to)})" if operator.attach_to else ""
+            print(f"  - {operator.operator}{attach}")
+    else:
+        print("  - NONE")
+    print()
+
+    print("[6. Atomic Subquestions]")
+    if not subquestions:
+        print("  (no atomic subquestions generated)")
+    for item in subquestions:
+        print(f"  q{item.index}: {item.question}")
+        if item.answer_variable:
+            print(f"      answer: {item.answer_variable}")
+        print()
+
+    if debug:
+        print("[Debug]")
+        debug_payload = {
+            "placeholder_replacements": replacement.replacements,
+            "anchor_edges": [
+                {
+                    "source": edge.source,
+                    "target": edge.target,
+                    "weight": edge.weight,
+                    "path_words": edge.path_words,
+                    "relations": edge.relations,
+                }
+                for edge in anchor_graph.edges
+            ],
+        }
+        print(json.dumps(debug_payload, ensure_ascii=False, indent=2))
+        print()
+
+
+def _print_nodes(nodes: list[Any]) -> None:
+    if not nodes:
+        print("  (none)")
+        return
+    for node in nodes:
+        print(f"  - {node.placeholder}: {node.text}")
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+    raise SystemExit(main())

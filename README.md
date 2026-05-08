@@ -1,64 +1,78 @@
-# Hypergraph RAG Query Decomposer
+# DEPO One-Hop Atomic Subquestion Decomposition
 
-Python framework for decomposing complex questions into a typed query graph and strictly atomic one-hop sub-questions.
+This project implements the method in `depo.md`:
 
-## What it does
+1. identify entity and type-variable anchors with `gpt-4o-mini`
+2. replace anchors with natural CamelCase placeholders
+3. parse the placeholder question with Stanford CoreNLP Enhanced++ dependencies
+4. build an anchor MST from dependency-graph shortest paths
+5. build the final AST by adding only allowed operators
+6. generate atomic subquestions from adjacent one-hop AST edges
 
-1. Calls an OpenAI-compatible API to extract:
-   - concrete entities
-   - typed variables
-   - one-hop relation units
-   - logical operators
-   - branch and merge hints
-2. Builds an auxiliary dependency parse with spaCy.
-3. Constructs a typed query graph with `networkx.DiGraph`.
-4. Calls the LLM once per relation edge to generate exactly one atomic sub-question.
-5. Produces an execution plan with dependency levels for both retrieval and logical steps.
+The CLI prints human-readable sections and does not write complex JSON by default.
 
-## Project layout
+## Install Dependencies
 
-- `main.py`: runnable CLI demo
-- `hypergraph_rag/clients.py`: OpenAI-compatible client and mock client
-- `hypergraph_rag/parsing.py`: spaCy dependency parsing
-- `hypergraph_rag/query_ast.py`: typed query graph construction
-- `hypergraph_rag/execution.py`: atomic question generation and execution plan
-- `tests/test_pipeline.py`: simple reference tests
-
-## Setup
-
-```bash
-python -m pip install -r requirements.txt
-python -m spacy download en_core_web_sm
+```powershell
+pip install -r requirements.txt
 ```
 
-Environment variables:
+## Configure OpenAI API
 
-```bash
-OPENAI_API_KEY=...
-OPENAI_BASE_URL=https://api.openai.com/v1
+Environment variables have priority over command-line values.
+
+```powershell
+$env:OPENAI_API_KEY="your_api_key"
+$env:OPENAI_BASE_URL="https://api.openai.com/v1"
 ```
 
-## CLI examples
+You can also pass values on the command line when the environment variables are not set:
 
-Single question:
+```powershell
+python main.py --api-key "your_api_key" --base-url "https://api.openai.com/v1"
+```
 
-```bash
+## Start Stanford CoreNLP
+
+Download and unzip Stanford CoreNLP, then run this command from the CoreNLP directory:
+
+```powershell
+java -mx4g -cp "*" edu.stanford.nlp.pipeline.StanfordCoreNLPServer -port 9000 -timeout 15000
+```
+
+The default CLI URL is `http://localhost:9000`. Use `--corenlp-url` to change it.
+
+## Run `questions.json`
+
+`questions.json` may be either:
+
+```json
+["question1", "question2"]
+```
+
+or:
+
+```json
+[{"id": "q1", "question": "question1"}]
+```
+
+Run:
+
+```powershell
+python main.py
+```
+
+## Run One Manual Question
+
+```powershell
 python main.py --question "Which university did the CEO of the artificial intelligence company that developed AlphaGo graduate from and in which city is this university located?"
 ```
 
-Batch mode:
+## Debug Output
 
-```bash
-python main.py --questions-file questions.json --output decomposed_questions.json
+Default output is concise and human-readable. To include extra intermediate structures:
+
+```powershell
+python main.py --debug
 ```
 
-Mock demo for the two reference examples:
-
-```bash
-python main.py --mock --question "Do director of film Ten9Eight: Shoot For The Moon and director of film Sabotage (1936 Film) share the same nationality?"
-```
-
-## Notes
-
-- The dependency parse is auxiliary evidence. If spaCy or the requested spaCy model is unavailable, the code falls back to a heuristic parse and records warnings in the result.
-- Logical operations are emitted as `logical_operation` execution steps instead of atomic retrieval questions.
