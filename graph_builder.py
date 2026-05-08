@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import itertools
-import re
-from typing import Any, Callable
+from collections import deque
+from typing import Callable
 
 import networkx as nx
 
-from models import AnchorEdge, AnchorGraph, CoreNLPToken, DependencyParse, ExtractedNode, ExtractionResult
+from models import AnchorEdge, AnchorGraph, DependencyParse, ExtractedNode, ExtractionResult
 
 
 class AnchorGraphError(RuntimeError):
@@ -23,11 +23,27 @@ class GraphBuilder:
         if not anchors:
             raise AnchorGraphError("No entity/type-variable anchors were extracted.")
 
-        folded_graph, anchor_positions = self._fold_dependency_graph(dependency_parse, extraction)
-        missing = [anchor for anchor in anchors if anchor not in folded_graph]
+        token_graph = nx.Graph()
+        token_words = {token.index: token.word for token in dependency_parse.tokens}
+        for token in dependency_parse.tokens:
+            token_graph.add_node(token.index, word=token.word)
+
+        for edge in dependency_parse.edges:
+            token_graph.add_edge(
+                edge.source_index,
+                edge.target_index,
+                weight=1,
+                relation=edge.relation,
+            )
+
+        anchor_positions = {
+            anchor: [index for index, word in token_words.items() if word == anchor]
+            for anchor in anchors
+        }
+        missing = [anchor for anchor, positions in anchor_positions.items() if not positions]
         if missing:
             raise AnchorGraphError(
-                "The following anchors could not be aligned to CoreNLP token spans: "
+                "The following anchors were not found as CoreNLP tokens after placeholder replacement: "
                 + ", ".join(missing)
             )
 
@@ -43,23 +59,27 @@ class GraphBuilder:
             )
 
         for left, right in itertools.combinations(anchors, 2):
-            path = self._shortest_anchor_path(folded_graph, left, right)
+            path = self._shortest_anchor_path(
+                token_graph,
+                anchor_positions[left],
+                anchor_positions[right],
+            )
             if path is None:
                 continue
-            relations = _relations_for_path(folded_graph, path)
+            relations = _relations_for_path(token_graph, path)
             closure.add_edge(
                 left,
                 right,
                 weight=max(len(path) - 1, 1),
                 token_path=path,
-                path_words=_path_words(folded_graph, path),
+                path_words=[token_words.get(index, str(index)) for index in path],
                 relations=relations,
             )
 
-        if closure.number_of_nodes() > 1 and not nx.is_connected(closure):
+        if not nx.is_connected(closure):
             components = [sorted(component) for component in nx.connected_components(closure)]
             raise AnchorGraphError(
-                "Could not connect all anchors in the folded dependency graph. Components: "
+                "Could not connect all anchors in the dependency graph. Components: "
                 + "; ".join(", ".join(component) for component in components)
             )
 
@@ -90,143 +110,22 @@ class GraphBuilder:
 
         return AnchorGraph(graph=anchor_graph, edges=anchor_edges, anchor_positions=anchor_positions)
 
-    def _fold_dependency_graph(
-        self,
-        dependency_parse: DependencyParse,
-        extraction: ExtractionResult,
-    ) -> tuple[nx.Graph, dict[str, list[int]]]:
-        tokens_by_index = {token.index: token for token in dependency_parse.tokens}
-        anchor_positions = self._align_anchor_spans(dependency_parse.tokens, extraction.nodes)
-        token_to_anchor = _resolve_token_anchor_conflicts(anchor_positions, extraction.nodes)
-        all_internal_tokens = set(token_to_anchor)
-
-        graph = nx.Graph()
-        for token in dependency_parse.tokens:
-            if token.index in all_internal_tokens:
-                continue
-            graph.add_node(
-                token.index,
-                kind="token",
-                word=token.word,
-                text=token.word,
-                order=token.index,
-                character_offset_begin=token.character_offset_begin,
-                character_offset_end=token.character_offset_end,
-            )
-
-        for node in extraction.nodes:
-            internal_tokens = sorted(anchor_positions.get(node.placeholder, []))
-            if not internal_tokens:
-                continue
-            first_token = min(internal_tokens)
-            graph.add_node(
-                node.placeholder,
-                kind=node.kind,
-                word=node.placeholder,
-                text=node.text,
-                semantic_type=node.semantic_type,
-                order=first_token,
-                folded_token_indices=internal_tokens,
-            )
-
-        for edge in dependency_parse.edges:
-            source = token_to_anchor.get(edge.source_index, edge.source_index)
-            target = token_to_anchor.get(edge.target_index, edge.target_index)
-            if source == target:
-                continue
-            self._ensure_folded_endpoint(graph, source, tokens_by_index, extraction)
-            self._ensure_folded_endpoint(graph, target, tokens_by_index, extraction)
-            _add_or_merge_edge(
-                graph,
-                source,
-                target,
-                relation=edge.relation,
-                directed_source=edge.source_index,
-                directed_target=edge.target_index,
-            )
-
-        return graph, anchor_positions
-
-    def _align_anchor_spans(
-        self,
-        tokens: list[CoreNLPToken],
-        nodes: list[ExtractedNode],
-    ) -> dict[str, list[int]]:
-        alignments: dict[str, list[int]] = {}
-        scores: dict[tuple[str, int], float] = {}
-
-        for node in nodes:
-            matched: list[int] = []
-            if node.start is not None and node.end is not None and node.start < node.end:
-                for token in tokens:
-                    score = _span_overlap_score(
-                        node.start,
-                        node.end,
-                        token.character_offset_begin,
-                        token.character_offset_end,
-                    )
-                    if score >= 0.5:
-                        matched.append(token.index)
-                        scores[(node.placeholder, token.index)] = score
-
-            if not matched:
-                matched = _fallback_text_alignment(tokens, node)
-                for token_index in matched:
-                    scores[(node.placeholder, token_index)] = 1.0
-
-            alignments[node.placeholder] = matched
-
-        resolved = _resolve_alignment_conflicts(alignments, scores, nodes)
-        missing = [node.placeholder for node in nodes if not resolved.get(node.placeholder)]
-        if missing:
-            raise AnchorGraphError(
-                "Could not align extracted spans to CoreNLP tokens for anchors: "
-                + ", ".join(missing)
-            )
-        return resolved
-
-    @staticmethod
-    def _ensure_folded_endpoint(
-        graph: nx.Graph,
-        node_id: int | str,
-        tokens_by_index: dict[int, CoreNLPToken],
-        extraction: ExtractionResult,
-    ) -> None:
-        if node_id in graph:
-            return
-        if isinstance(node_id, int) and node_id in tokens_by_index:
-            token = tokens_by_index[node_id]
-            graph.add_node(
-                node_id,
-                kind="token",
-                word=token.word,
-                text=token.word,
-                order=token.index,
-                character_offset_begin=token.character_offset_begin,
-                character_offset_end=token.character_offset_end,
-            )
-            return
-        node = extraction.placeholder_to_node.get(str(node_id))
-        if node is not None:
-            graph.add_node(
-                node.placeholder,
-                kind=node.kind,
-                word=node.placeholder,
-                text=node.text,
-                semantic_type=node.semantic_type,
-                order=node.start if node.start is not None else 10**9,
-            )
-
     @staticmethod
     def _shortest_anchor_path(
         graph: nx.Graph,
-        left: str,
-        right: str,
-    ) -> list[Any] | None:
-        try:
-            return nx.shortest_path(graph, left, right, weight="weight")
-        except nx.NetworkXNoPath:
-            return None
+        left_positions: list[int],
+        right_positions: list[int],
+    ) -> list[int] | None:
+        best_path: list[int] | None = None
+        for left in left_positions:
+            for right in right_positions:
+                try:
+                    path = nx.shortest_path(graph, left, right, weight="weight")
+                except nx.NetworkXNoPath:
+                    continue
+                if best_path is None or len(path) < len(best_path):
+                    best_path = path
+        return best_path
 
 
 def format_dependency_edges(dependency_parse: DependencyParse) -> list[str]:
@@ -296,139 +195,10 @@ def format_graph_lines(
     return lines or ["  (empty graph)"]
 
 
-def _span_overlap_score(span_start: int, span_end: int, token_start: int, token_end: int) -> float:
-    if token_start < 0 or token_end <= token_start:
-        return 0.0
-    overlap = max(0, min(span_end, token_end) - max(span_start, token_start))
-    if overlap <= 0:
-        return 0.0
-    token_len = max(token_end - token_start, 1)
-    span_len = max(span_end - span_start, 1)
-    return max(overlap / token_len, overlap / span_len)
-
-
-def _fallback_text_alignment(tokens: list[CoreNLPToken], node: ExtractedNode) -> list[int]:
-    target = _normalize_for_alignment(node.text)
-    if not target:
-        return []
-
-    matches: list[list[int]] = []
-    token_count = max(len(re.findall(r"[A-Za-z0-9]+", node.text)), 1)
-    max_window = min(len(tokens), token_count + 8)
-    sorted_tokens = sorted(tokens, key=lambda token: token.index)
-
-    for start in range(len(sorted_tokens)):
-        for end in range(start + 1, min(len(sorted_tokens), start + max_window) + 1):
-            candidate = _normalize_for_alignment(" ".join(token.word for token in sorted_tokens[start:end]))
-            if candidate == target:
-                matches.append([token.index for token in sorted_tokens[start:end]])
-
-    if not matches:
-        return []
-    occurrence_index = max((node.occurrence or 1) - 1, 0)
-    if occurrence_index >= len(matches):
-        occurrence_index = 0
-    return matches[occurrence_index]
-
-
-def _normalize_for_alignment(text: str) -> str:
-    return "".join(re.findall(r"[A-Za-z0-9]+", text.lower()))
-
-
-def _resolve_alignment_conflicts(
-    alignments: dict[str, list[int]],
-    scores: dict[tuple[str, int], float],
-    nodes: list[ExtractedNode],
-) -> dict[str, list[int]]:
-    node_by_placeholder = {node.placeholder: node for node in nodes}
-    token_claims: dict[int, list[str]] = {}
-    for placeholder, token_indices in alignments.items():
-        for token_index in token_indices:
-            token_claims.setdefault(token_index, []).append(placeholder)
-
-    winners: dict[int, str] = {}
-    for token_index, placeholders in token_claims.items():
-        winners[token_index] = min(
-            placeholders,
-            key=lambda placeholder: (
-                -scores.get((placeholder, token_index), 0.0),
-                _span_length(node_by_placeholder[placeholder]),
-                node_by_placeholder[placeholder].start if node_by_placeholder[placeholder].start is not None else 10**9,
-            ),
-        )
-
-    resolved: dict[str, list[int]] = {placeholder: [] for placeholder in alignments}
-    for token_index, placeholder in winners.items():
-        resolved[placeholder].append(token_index)
-    for placeholder in resolved:
-        resolved[placeholder].sort()
-    return resolved
-
-
-def _resolve_token_anchor_conflicts(
-    anchor_positions: dict[str, list[int]],
-    nodes: list[ExtractedNode],
-) -> dict[int, str]:
-    node_order = {node.placeholder: index for index, node in enumerate(nodes)}
-    token_to_anchor: dict[int, str] = {}
-    for placeholder in sorted(anchor_positions, key=lambda item: node_order.get(item, 10**9)):
-        for token_index in anchor_positions[placeholder]:
-            token_to_anchor[token_index] = placeholder
-    return token_to_anchor
-
-
-def _span_length(node: ExtractedNode) -> int:
-    if node.start is None or node.end is None:
-        return len(node.text)
-    return max(node.end - node.start, 1)
-
-
-def _add_or_merge_edge(
-    graph: nx.Graph,
-    source: int | str,
-    target: int | str,
-    relation: str,
-    directed_source: int,
-    directed_target: int,
-) -> None:
-    if graph.has_edge(source, target):
-        relations = list(graph.edges[source, target].get("relations", []))
-        directed_edges = list(graph.edges[source, target].get("directed_edges", []))
-    else:
-        relations = []
-        directed_edges = []
-
-    if relation and relation not in relations:
-        relations.append(relation)
-    directed_edges.append(
-        {
-            "source_index": directed_source,
-            "target_index": directed_target,
-            "relation": relation,
-        }
-    )
-    graph.add_edge(
-        source,
-        target,
-        weight=1,
-        relation="|".join(relations),
-        relations=relations,
-        directed_edges=directed_edges,
-    )
-
-
-def _path_words(graph: nx.Graph, path: list[Any]) -> list[str]:
-    return [str(graph.nodes[node].get("word", node)) for node in path]
-
-
-def _relations_for_path(graph: nx.Graph, path: list[Any]) -> list[str]:
+def _relations_for_path(graph: nx.Graph, path: list[int]) -> list[str]:
     relations: list[str] = []
     for left, right in zip(path, path[1:]):
-        edge_relations = graph.edges[left, right].get("relations")
-        if edge_relations:
-            relations.append("|".join(str(item) for item in edge_relations if item))
-        else:
-            relations.append(str(graph.edges[left, right].get("relation", "")))
+        relations.append(str(graph.edges[left, right].get("relation", "")))
     return relations
 
 
@@ -484,6 +254,7 @@ def _choose_multi_entity_target(graph: nx.Graph, entity_nodes: list[str]) -> str
                 distance = 10**6
             total += distance
             max_distance = max(max_distance, distance)
+        # Prefer later non-entity answer/result variables when distances tie.
         return (max_distance, total, -_node_order(graph, node))
 
     return min(candidates, key=score)
