@@ -54,6 +54,8 @@ class PlaceholderReplacement:
 class CoreNLPToken:
     index: int
     word: str
+    character_offset_begin: int = -1
+    character_offset_end: int = -1
     lemma: str | None = None
     pos: str | None = None
 
@@ -82,7 +84,7 @@ class AnchorEdge:
     source: str
     target: str
     weight: int
-    token_path: list[int]
+    token_path: list[Any]
     path_words: list[str]
     relations: list[str]
 
@@ -122,4 +124,3 @@ class AtomicSubquestion:
     source_node: str | None = None
     target_node: str | None = None
     operator: str | None = None
-

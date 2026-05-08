@@ -32,15 +32,31 @@ You can also pass values on the command line when the environment variables are 
 python main.py --api-key "your_api_key" --base-url "https://api.openai.com/v1"
 ```
 
-## Start Stanford CoreNLP
+## Install Stanford CoreNLP For Stanza
 
-Download and unzip Stanford CoreNLP, then run this command from the CoreNLP directory:
+The program uses `stanza.server.CoreNLPClient` to start and stop CoreNLP automatically.
+You do not need to manually run `StanfordCoreNLPServer`.
+
+Java is still required. After installing Python dependencies, install the CoreNLP package once:
 
 ```powershell
-java -mx4g -cp "*" edu.stanford.nlp.pipeline.StanfordCoreNLPServer -port 9000 -timeout 15000
+python -c "import stanza; stanza.install_corenlp()"
 ```
 
-The default CLI URL is `http://localhost:9000`. Use `--corenlp-url` to change it.
+Recent Stanza versions may install CoreNLP under a versioned cache directory such as
+`C:\Users\<you>\AppData\Local\StanfordNLP\stanza\Cache\1.11.0\corenlp`.
+The CLI tries to detect that cache automatically.
+
+If you install CoreNLP manually or into a custom directory, pass `--corenlp-home` or set
+`CORENLP_HOME`:
+
+```powershell
+$env:CORENLP_HOME="D:\tools\stanford-corenlp"
+```
+
+The default managed endpoint is `http://localhost:9000`. Use `--corenlp-url` only if that
+port is already occupied. The server is started once when the program begins processing
+questions and is closed automatically when the program exits.
 
 ## Run `questions.json`
 
@@ -76,3 +92,15 @@ Default output is concise and human-readable. To include extra intermediate stru
 python main.py --debug
 ```
 
+Optional CoreNLP runtime settings:
+
+```powershell
+python main.py --corenlp-url "http://localhost:9007" --corenlp-memory 6G --corenlp-timeout-ms 120000
+```
+
+If Stanza says CoreNLP is installed but `CoreNLPClient` cannot find it, point the CLI to
+the directory that contains `stanford-corenlp-*.jar` files:
+
+```powershell
+python main.py --corenlp-home "C:\Users\sugarfree\AppData\Local\StanfordNLP\stanza\Cache\1.11.0\corenlp"
+```

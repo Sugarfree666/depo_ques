@@ -18,7 +18,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--questions-file", default="questions.json", help="Path to questions.json.")
     parser.add_argument("--api-key", help="OpenAI API key. Used only if OPENAI_API_KEY is not set.")
     parser.add_argument("--base-url", help="OpenAI base URL. Used only if OPENAI_BASE_URL is not set.")
-    parser.add_argument("--corenlp-url", default="http://localhost:9000", help="Stanford CoreNLP server URL.")
+    parser.add_argument(
+        "--corenlp-url",
+        default="http://localhost:9000",
+        help="Endpoint used by Stanza CoreNLPClient for the managed CoreNLP server.",
+    )
+    parser.add_argument("--corenlp-memory", default="4G", help="Java heap memory for managed CoreNLP.")
+    parser.add_argument(
+        "--corenlp-home",
+        help="Path to a Stanford CoreNLP directory containing stanford-corenlp*.jar files.",
+    )
+    parser.add_argument(
+        "--corenlp-timeout-ms",
+        type=int,
+        default=60000,
+        help="CoreNLP annotation timeout in milliseconds.",
+    )
     parser.add_argument("--debug", action="store_true", help="Print additional intermediate structures.")
     return parser.parse_args()
 
@@ -43,23 +58,28 @@ def main() -> int:
 
         llm_client = LLMClient(api_key=api_key, base_url=base_url, model="gpt-4o-mini")
         extractor = EntityExtractor(llm_client)
-        parser = CoreNLPParser(args.corenlp_url)
         graph_builder = GraphBuilder()
         ast_builder = ASTBuilder(llm_client)
         subquestion_generator = SubquestionGenerator(llm_client)
 
-        for index, record in enumerate(records, start=1):
-            result = run_pipeline(
-                record=record,
-                index=index,
-                extractor=extractor,
-                parser=parser,
-                graph_builder=graph_builder,
-                ast_builder=ast_builder,
-                subquestion_generator=subquestion_generator,
-                debug=args.debug,
-            )
-            print_result(index, record, result, debug=args.debug)
+        with CoreNLPParser(
+            args.corenlp_url,
+            timeout_ms=args.corenlp_timeout_ms,
+            memory=args.corenlp_memory,
+            corenlp_home=args.corenlp_home,
+        ) as parser:
+            for index, record in enumerate(records, start=1):
+                result = run_pipeline(
+                    record=record,
+                    index=index,
+                    extractor=extractor,
+                    parser=parser,
+                    graph_builder=graph_builder,
+                    ast_builder=ast_builder,
+                    subquestion_generator=subquestion_generator,
+                    debug=args.debug,
+                )
+                print_result(index, record, result, debug=args.debug)
     except ModuleNotFoundError as exc:
         print(f"Missing dependency: {exc.name}. Run: pip install -r requirements.txt", file=sys.stderr)
         return 2
@@ -84,7 +104,7 @@ def run_pipeline(
 
     extraction = extractor.extract(record.question)
     replacement = replace_with_placeholders(record.question, extraction)
-    dependency_parse = parser.parse(replacement.question)
+    dependency_parse = parser.parse(record.question)
     anchor_graph = graph_builder.build_anchor_graph(dependency_parse, extraction)
     ast = ast_builder.build(record.question, extraction, replacement, anchor_graph)
     subquestions = subquestion_generator.generate(record.question, ast, extraction)
