@@ -172,6 +172,8 @@ class CoreNLPParser:
                         word=token.get("word", ""),
                         lemma=token.get("lemma"),
                         pos=token.get("pos"),
+                        character_offset_begin=int(token.get("characterOffsetBegin", -1)),
+                        character_offset_end=int(token.get("characterOffsetEnd", -1)),
                     )
                 )
 

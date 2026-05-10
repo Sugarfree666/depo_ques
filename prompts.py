@@ -15,6 +15,9 @@ ALLOWED_OPERATORS = [
 
 GLOBAL_METHOD_GUARD = """
 You are implementing the DEPO method from depo.md.
+CoreNLP parses the original unmodified question; placeholders are display/anchor labels only.
+After parsing, entity/type-variable token spans are folded into placeholder supernodes on the dependency graph.
+The MST is an anchor-only MST over entity/type-variable placeholder nodes.
 Do not do ordinary end-to-end subquestion decomposition.
 Do only the current pipeline step.
 Do not introduce entities or type variables that are not present in the original question.
@@ -32,7 +35,8 @@ Use Greek ordinals in this order: Alpha, Beta, Gamma, Delta, Epsilon, Zeta, Eta,
 Examples: CompanyAlpha, PersonAlpha, PersonBeta, FilmAlpha, FilmBeta, NationalityAlpha.
 Use EntityAlpha only when no more specific semantic type is natural.
 For repeated mentions with different roles, keep separate nodes with separate placeholders.
-Return exact character spans when possible, using Python-style start inclusive and end exclusive.
+Return exact character spans in the original question whenever possible, using Python-style start inclusive and end exclusive.
+These spans will be aligned to CoreNLP tokens after the original question is parsed, so span accuracy is critical.
 """
 )
 
@@ -73,6 +77,7 @@ Rules:
 - Do not invent nodes not explicitly supported by the question text.
 - Keep duplicate role variables separate when they belong to different branches, such as two directors in a comparison.
 - Preserve exact surface text from the original question.
+- Return accurate start/end character offsets for each surface span in the original question.
 - Prefer semantic placeholders like PersonAlpha for CEO/director, FilmAlpha for films, CompanyAlpha for companies.
 
 Output JSON with exactly this shape:
@@ -87,6 +92,7 @@ OPERATOR_SELECTION_SYSTEM = (
     GLOBAL_METHOD_GUARD
     + f"""
 Current step: choose operators and shared-node attachments for the final AST.
+The input graph is already an anchor-only MST produced after dependency-graph subtree folding.
 You must not rewrite the anchor MST.
 You must not add, remove, or reorder anchor-anchor edges.
 You must not generate subquestions.
@@ -144,6 +150,7 @@ Use only the two provided adjacent nodes and the original question.
 Do not use any other AST nodes.
 Do not use multi-hop information.
 Do not generate a sequence of subquestions.
+Do not infer the complete decomposition; generate only the one subquestion for this one adjacent edge.
 Return JSON only.
 """
 )
@@ -187,4 +194,3 @@ Rules:
 Output JSON with exactly this shape:
 {json.dumps(schema, indent=2)}
 """.strip()
-

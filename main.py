@@ -4,10 +4,17 @@ import argparse
 import json
 import os
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from io_utils import read_questions
 from models import ASTResult, AtomicSubquestion, ExtractionResult, PlaceholderReplacement, QuestionRecord
+
+if TYPE_CHECKING:
+    from ast_builder import ASTBuilder
+    from corenlp_parser import CoreNLPParser
+    from entity_extractor import EntityExtractor
+    from graph_builder import GraphBuilder
+    from subquestion_generator import SubquestionGenerator
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,11 +100,11 @@ def main() -> int:
 def run_pipeline(
     record: QuestionRecord,
     index: int,
-    extractor: EntityExtractor,
-    parser: CoreNLPParser,
-    graph_builder: GraphBuilder,
-    ast_builder: ASTBuilder,
-    subquestion_generator: SubquestionGenerator,
+    extractor: "EntityExtractor",
+    parser: "CoreNLPParser",
+    graph_builder: "GraphBuilder",
+    ast_builder: "ASTBuilder",
+    subquestion_generator: "SubquestionGenerator",
     debug: bool = False,
 ) -> dict[str, Any]:
     from placeholder import replace_with_placeholders
@@ -167,13 +174,23 @@ def print_result(index: int, record: QuestionRecord, result: dict[str, Any], deb
         print("  (no dependency edges)")
     print()
 
-    print("[4. Anchor MST / Anchor Graph]")
+    print("[4. Folded Dependency Graph]")
+    print("Edges:")
+    folded_edge_lines = _format_folded_dependency_edges(anchor_graph)
+    if folded_edge_lines:
+        for line in folded_edge_lines:
+            print(line)
+    else:
+        print("  (no folded dependency edges)")
+    print()
+
+    print("[5. Anchor MST / Anchor Graph]")
     entity_nodes = [node.placeholder for node in extraction.entities]
     for line in format_graph_lines(anchor_graph.graph, entity_nodes=entity_nodes):
         print(line)
     print()
 
-    print("[5. Final AST]")
+    print("[6. Final AST]")
     operator_nodes = [
         node for node, attrs in ast.graph.nodes(data=True) if attrs.get("kind") == "operator"
     ]
@@ -194,7 +211,7 @@ def print_result(index: int, record: QuestionRecord, result: dict[str, Any], deb
         print("  - NONE")
     print()
 
-    print("[6. Atomic Subquestions]")
+    print("[7. Atomic Subquestions]")
     if not subquestions:
         print("  (no atomic subquestions generated)")
     for item in subquestions:
@@ -205,8 +222,36 @@ def print_result(index: int, record: QuestionRecord, result: dict[str, Any], deb
 
     if debug:
         print("[Debug]")
+        folded_edges = []
+        if anchor_graph.folded_graph is not None:
+            for source, target, attrs in anchor_graph.folded_graph.edges(data=True):
+                folded_edges.append(
+                    {
+                        "source": source,
+                        "target": target,
+                        "relations": attrs.get("relations", []),
+                        "path_words": [
+                            anchor_graph.folded_graph.nodes[source].get("word", source),
+                            anchor_graph.folded_graph.nodes[target].get("word", target),
+                        ],
+                    }
+                )
         debug_payload = {
+            "original_question": record.question,
+            "placeholder_mapping": replacement.mapping,
             "placeholder_replacements": replacement.replacements,
+            "original_dependency_edges": [
+                {
+                    "source": edge.source,
+                    "relation": edge.relation,
+                    "target": edge.target,
+                    "source_index": edge.source_index,
+                    "target_index": edge.target_index,
+                }
+                for edge in dependency_parse.edges
+            ],
+            "anchor_positions": anchor_graph.anchor_positions,
+            "folded_dependency_edges": folded_edges,
             "anchor_edges": [
                 {
                     "source": edge.source,
@@ -228,6 +273,35 @@ def _print_nodes(nodes: list[Any]) -> None:
         return
     for node in nodes:
         print(f"  - {node.placeholder}: {node.text}")
+
+
+def _format_folded_dependency_edges(anchor_graph: Any) -> list[str]:
+    folded_graph = getattr(anchor_graph, "folded_graph", None)
+    if folded_graph is None:
+        return []
+
+    lines: list[str] = []
+    for source, target, attrs in sorted(
+        folded_graph.edges(data=True),
+        key=lambda item: (
+            folded_graph.nodes[item[0]].get("order", 10**9),
+            folded_graph.nodes[item[1]].get("order", 10**9),
+            str(item[0]),
+            str(item[1]),
+        ),
+    ):
+        source_label = _folded_node_label(folded_graph, source)
+        target_label = _folded_node_label(folded_graph, target)
+        relation = "|".join(attrs.get("relations", [])) or attrs.get("relation", "")
+        lines.append(f"  - {source_label} --{relation}--> {target_label}")
+    return lines
+
+
+def _folded_node_label(graph: Any, node: Any) -> str:
+    attrs = graph.nodes[node]
+    if attrs.get("kind") in {"entity", "type_variable"}:
+        return str(node)
+    return str(attrs.get("word", node))
 
 
 if __name__ == "__main__":

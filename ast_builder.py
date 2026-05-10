@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import networkx as nx
 
-from llm_client import LLMClient
 from models import AnchorGraph, ASTResult, ExtractionResult, OperatorSelection, PlaceholderReplacement
 from prompts import ALLOWED_OPERATORS, OPERATOR_SELECTION_SYSTEM, build_operator_prompt
 
+if TYPE_CHECKING:
+    from llm_client import LLMClient
+
 
 class ASTBuilder:
-    def __init__(self, llm_client: LLMClient) -> None:
+    def __init__(self, llm_client: "LLMClient") -> None:
         self.llm_client = llm_client
 
     def build(
@@ -125,4 +127,3 @@ class ASTBuilder:
             if type_nodes:
                 return [max(type_nodes, key=lambda node: graph.nodes[node].get("order", 0))]
         return [max(non_operator_nodes, key=lambda node: graph.degree(node))]
-

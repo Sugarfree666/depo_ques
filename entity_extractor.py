@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from llm_client import LLMClient
 from models import ExtractedNode, ExtractionResult
 from prompts import ENTITY_EXTRACTION_SYSTEM, build_entity_extraction_prompt
+
+if TYPE_CHECKING:
+    from llm_client import LLMClient
 
 GREEK_ORDINALS = [
     "Alpha",
@@ -56,7 +58,7 @@ ROLE_TO_SEMANTIC_TYPE = {
 
 
 class EntityExtractor:
-    def __init__(self, llm_client: LLMClient) -> None:
+    def __init__(self, llm_client: "LLMClient") -> None:
         self.llm_client = llm_client
 
     def extract(self, question: str) -> ExtractionResult:
@@ -71,6 +73,7 @@ class EntityExtractor:
             question,
         )
         result = ExtractionResult(entities=entities, type_variables=type_variables)
+        _repair_duplicate_surface_spans(question, result.nodes)
         self._normalize_placeholders(result)
         return result
 
@@ -152,6 +155,53 @@ def resolve_span(
         index = 0
     match = matches[index]
     return match.start(), match.end()
+
+
+def _repair_duplicate_surface_spans(question: str, nodes: list[ExtractedNode]) -> None:
+    grouped: dict[tuple[str, str], list[ExtractedNode]] = defaultdict(list)
+    for node in nodes:
+        grouped[(node.kind, _normalized_surface(node.text))].append(node)
+
+    for (_, normalized_text), group in grouped.items():
+        if len(group) <= 1 or not normalized_text:
+            continue
+
+        matches = list(re.finditer(re.escape(group[0].text), question, flags=re.IGNORECASE))
+        if len(matches) < len(group):
+            continue
+
+        spans = [(node.start, node.end) for node in group]
+        occurrences = [node.occurrence for node in group if node.occurrence is not None]
+        has_duplicate_span = len(set(spans)) < len(spans)
+        has_duplicate_occurrence = len(set(occurrences)) < len(occurrences)
+        has_missing_span = any(not _valid_span(question, node) for node in group)
+
+        if has_duplicate_span or has_duplicate_occurrence or has_missing_span:
+            for index, node in enumerate(group):
+                match = matches[index]
+                node.start = match.start()
+                node.end = match.end()
+                node.occurrence = index + 1
+            continue
+
+        for node in group:
+            for index, match in enumerate(matches, start=1):
+                if node.start == match.start() and node.end == match.end():
+                    node.occurrence = index
+                    break
+
+
+def _valid_span(question: str, node: ExtractedNode) -> bool:
+    return (
+        node.start is not None
+        and node.end is not None
+        and 0 <= node.start < node.end <= len(question)
+        and question[node.start : node.end].lower() == node.text.lower()
+    )
+
+
+def _normalized_surface(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
 
 
 def _next_placeholder(base: str, counters: dict[str, int]) -> str:

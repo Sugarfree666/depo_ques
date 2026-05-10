@@ -97,6 +97,7 @@ class AnchorGraph:
     graph: Any
     edges: list[AnchorEdge]
     anchor_positions: dict[str, list[int]]
+    folded_graph: Any | None = None
 
 
 @dataclass

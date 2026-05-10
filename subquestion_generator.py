@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import networkx as nx
 
-from llm_client import LLMClient
 from models import ASTResult, AtomicSubquestion, ExtractionResult
 from prompts import ONE_HOP_SUBQUESTION_SYSTEM, build_one_hop_prompt
+
+if TYPE_CHECKING:
+    from llm_client import LLMClient
 
 
 @dataclass
@@ -21,7 +24,7 @@ class _GenerationState:
 
 
 class SubquestionGenerator:
-    def __init__(self, llm_client: LLMClient) -> None:
+    def __init__(self, llm_client: "LLMClient") -> None:
         self.llm_client = llm_client
 
     def generate(
