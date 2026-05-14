@@ -15,9 +15,10 @@ ALLOWED_OPERATORS = [
 
 GLOBAL_METHOD_GUARD = """
 You are implementing the DEPO method from depo.md.
-CoreNLP parses the original unmodified question; placeholders are display/anchor labels only.
-After parsing, entity/type-variable token spans are folded into placeholder supernodes on the dependency graph.
-The MST is an anchor-only MST over entity/type-variable placeholder nodes.
+CoreNLP parses a selectively masked question: only complex long entities may be replaced by EntityA/EntityB.
+Type variables and syntactic scaffold words stay in natural language.
+After parsing, entity/type-variable token spans are folded into anchor supernodes on the dependency graph.
+The MST is an anchor-only MST over entity/type-variable anchor nodes.
 Do not do ordinary end-to-end subquestion decomposition.
 Do only the current pipeline step.
 Do not introduce entities or type variables that are not present in the original question.
@@ -36,7 +37,7 @@ Examples: CompanyAlpha, PersonAlpha, PersonBeta, FilmAlpha, FilmBeta, Nationalit
 Use EntityAlpha only when no more specific semantic type is natural.
 For repeated mentions with different roles, keep separate nodes with separate placeholders.
 Return exact character spans in the original question whenever possible, using Python-style start inclusive and end exclusive.
-These spans will be aligned to CoreNLP tokens after the original question is parsed, so span accuracy is critical.
+These original spans will be shifted after selective masking and then aligned to CoreNLP tokens, so span accuracy is critical.
 """
 )
 

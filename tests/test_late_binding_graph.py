@@ -3,11 +3,13 @@ from __future__ import annotations
 import re
 import unittest
 
+import networkx as nx
+
 from entity_extractor import _repair_duplicate_surface_spans
 from ast_builder import ASTBuilder
 from graph_builder import GraphBuilder
 from models import CoreNLPToken, DependencyEdge, DependencyParse, ExtractionResult, ExtractedNode
-from placeholder import replace_with_placeholders
+from placeholder import replace_with_placeholders, selective_entity_masking
 from subquestion_generator import SubquestionGenerator
 
 
@@ -16,9 +18,12 @@ class FakeLLM:
         self.operator = operator
         self.attach_to = attach_to or []
         self.one_hop_calls = 0
+        self.operator_prompts: list[str] = []
+        self.one_hop_prompts: list[str] = []
 
     def chat_json(self, system_prompt: str, user_prompt: str, max_retries: int = 3) -> dict[str, object]:
         if "operator" in user_prompt and "operators" in user_prompt:
+            self.operator_prompts.append(user_prompt)
             return {
                 "operators": [
                     {
@@ -29,6 +34,7 @@ class FakeLLM:
                 ]
             }
         self.one_hop_calls += 1
+        self.one_hop_prompts.append(user_prompt)
         return {"question": f"mock one-hop question {self.one_hop_calls}?"}
 
 
@@ -58,6 +64,47 @@ def span(question: str, text: str, occurrence: int = 1) -> tuple[int, int]:
 
 
 class LateBindingGraphTests(unittest.TestCase):
+    def test_selective_masking_masks_complex_films_and_preserves_type_variables(self) -> None:
+        question = (
+            "Do director of film Ten9Eight: Shoot For The Moon and director of film "
+            "Sabotage (1936 Film) share the same nationality?"
+        )
+        extraction = ExtractionResult(
+            entities=[
+                ExtractedNode("FilmAlpha", "Ten9Eight: Shoot For The Moon", "entity", "Film", *span(question, "Ten9Eight: Shoot For The Moon")),
+                ExtractedNode("FilmBeta", "Sabotage (1936 Film)", "entity", "Film", *span(question, "Sabotage (1936 Film)")),
+            ],
+            type_variables=[
+                ExtractedNode("PersonAlpha", "director", "type_variable", "Person", *span(question, "director", 1), occurrence=1),
+                ExtractedNode("FilmVarAlpha", "film", "type_variable", "Film", *span(question, "film", 1), occurrence=1),
+                ExtractedNode("PersonBeta", "director", "type_variable", "Person", *span(question, "director", 2), occurrence=2),
+                ExtractedNode("FilmVarBeta", "film", "type_variable", "Film", *span(question, "film", 2), occurrence=2),
+                ExtractedNode("NationalityAlpha", "nationality", "type_variable", "Nationality", *span(question, "nationality")),
+            ],
+        )
+
+        replacement = selective_entity_masking(question, extraction)
+
+        self.assertEqual(
+            replacement.masked_question,
+            "Do director of film EntityA and director of film EntityB share the same nationality?",
+        )
+        self.assertEqual(set(replacement.mask_mapping), {"EntityA", "EntityB"})
+        self.assertEqual(replacement.mask_mapping["EntityA"]["text"], "Ten9Eight: Shoot For The Moon")
+        self.assertEqual(replacement.mask_mapping["EntityB"]["text"], "Sabotage (1936 Film)")
+
+        preserved_texts = [item["text"] for item in replacement.preserved_type_variables]
+        self.assertEqual(preserved_texts, ["director", "film", "director", "film", "nationality"])
+
+        anchor_extraction = replacement.anchor_extraction
+        self.assertIsNotNone(anchor_extraction)
+        assert anchor_extraction is not None
+        self.assertEqual([node.placeholder for node in anchor_extraction.entities], ["EntityA", "EntityB"])
+        for node in anchor_extraction.entities:
+            self.assertEqual(replacement.masked_question[node.start : node.end], node.placeholder)
+        for node in anchor_extraction.type_variables:
+            self.assertEqual(replacement.masked_question[node.start : node.end].lower(), node.text.lower())
+
     def test_duplicate_surface_span_repair_assigns_second_director(self) -> None:
         question = (
             "Do director of film Ten9Eight: Shoot For The Moon and director of film "
@@ -74,6 +121,50 @@ class LateBindingGraphTests(unittest.TestCase):
         second_start, second_end = span(question, "director", 2)
         self.assertEqual((nodes[0].start, nodes[0].end, nodes[0].occurrence), (first_start, first_end, 1))
         self.assertEqual((nodes[1].start, nodes[1].end, nodes[1].occurrence), (second_start, second_end, 2))
+
+    def test_selective_masked_compare_graph_maps_ast_labels_back_to_original_entities(self) -> None:
+        question = (
+            "Do director of film Ten9Eight: Shoot For The Moon and director of film "
+            "Sabotage (1936 Film) share the same nationality?"
+        )
+        extraction = ExtractionResult(
+            entities=[
+                ExtractedNode("FilmAlpha", "Ten9Eight: Shoot For The Moon", "entity", "Film", *span(question, "Ten9Eight: Shoot For The Moon")),
+                ExtractedNode("FilmBeta", "Sabotage (1936 Film)", "entity", "Film", *span(question, "Sabotage (1936 Film)")),
+            ],
+            type_variables=[
+                ExtractedNode("PersonAlpha", "director", "type_variable", "Person", *span(question, "director", 1), occurrence=1),
+                ExtractedNode("PersonBeta", "director", "type_variable", "Person", *span(question, "director", 2), occurrence=2),
+                ExtractedNode("NationalityAlpha", "nationality", "type_variable", "Nationality", *span(question, "nationality")),
+            ],
+        )
+        replacement = selective_entity_masking(question, extraction)
+        anchor_extraction = replacement.anchor_extraction
+        self.assertIsNotNone(anchor_extraction)
+        assert anchor_extraction is not None
+
+        tokens = make_tokens(replacement.masked_question)
+        edges = [
+            DependencyEdge("director", "nmod:of", "film", token_index(tokens, "director", 1), token_index(tokens, "film", 1)),
+            DependencyEdge("film", "appos", "EntityA", token_index(tokens, "film", 1), token_index(tokens, "EntityA")),
+            DependencyEdge("director", "obj", "nationality", token_index(tokens, "director", 1), token_index(tokens, "nationality")),
+            DependencyEdge("director", "nmod:of", "film", token_index(tokens, "director", 2), token_index(tokens, "film", 2)),
+            DependencyEdge("film", "appos", "EntityB", token_index(tokens, "film", 2), token_index(tokens, "EntityB")),
+            DependencyEdge("director", "obj", "nationality", token_index(tokens, "director", 2), token_index(tokens, "nationality")),
+        ]
+
+        anchor_graph = GraphBuilder().build_anchor_graph(
+            DependencyParse(tokens, edges),
+            anchor_extraction,
+        )
+        self.assertEqual(set(anchor_graph.graph.nodes), {"EntityA", "EntityB", "PersonAlpha", "PersonBeta", "NationalityAlpha"})
+
+        fake_llm = FakeLLM("COMPARE_SAME", ["NationalityAlpha"])
+        ast = ASTBuilder(fake_llm).build(question, anchor_extraction, replacement, anchor_graph)
+
+        self.assertEqual(ast.display_label("EntityA"), "Ten9Eight: Shoot For The Moon")
+        self.assertEqual(ast.display_label("EntityB"), "Sabotage (1936 Film)")
+        self.assertTrue(ast.graph.has_edge("NationalityAlpha", "COMPARE_SAME"))
 
     def test_compare_question_folds_fragmented_films_and_keeps_repeated_directors(self) -> None:
         question = (
@@ -122,6 +213,58 @@ class LateBindingGraphTests(unittest.TestCase):
             anchor_graph,
         )
         self.assertTrue(ast.graph.has_edge("NationalityAlpha", "COMPARE_SAME"))
+
+    def test_selective_masking_preserves_serial_question_types_and_ast_path(self) -> None:
+        question = (
+            "Which university did the CEO of the artificial intelligence company that developed "
+            "AlphaGo graduate from and in which city is this university located?"
+        )
+        extraction = ExtractionResult(
+            entities=[
+                ExtractedNode("EntityAlpha", "AlphaGo", "entity", "Entity", *span(question, "AlphaGo")),
+            ],
+            type_variables=[
+                ExtractedNode("UniversityAlpha", "university", "type_variable", "University", *span(question, "university", 1), occurrence=1),
+                ExtractedNode("PersonAlpha", "CEO", "type_variable", "Person", *span(question, "CEO")),
+                ExtractedNode("CompanyAlpha", "the artificial intelligence company", "type_variable", "Company", *span(question, "the artificial intelligence company")),
+                ExtractedNode("CityAlpha", "city", "type_variable", "City", *span(question, "city")),
+            ],
+        )
+
+        replacement = selective_entity_masking(question, extraction)
+        self.assertEqual(replacement.masked_question, question)
+        self.assertEqual(replacement.mask_mapping, {})
+        preserved_texts = {item["text"] for item in replacement.preserved_type_variables}
+        self.assertEqual(preserved_texts, {"university", "CEO", "the artificial intelligence company", "city"})
+
+        anchor_extraction = replacement.anchor_extraction
+        self.assertIsNotNone(anchor_extraction)
+        assert anchor_extraction is not None
+        tokens = make_tokens(replacement.masked_question)
+        edges = [
+            DependencyEdge("company", "acl", "AlphaGo", token_index(tokens, "company"), token_index(tokens, "AlphaGo")),
+            DependencyEdge("CEO", "nmod:of", "company", token_index(tokens, "CEO"), token_index(tokens, "company")),
+            DependencyEdge("graduate", "nsubj", "CEO", token_index(tokens, "graduate"), token_index(tokens, "CEO")),
+            DependencyEdge("graduate", "obl:from", "university", token_index(tokens, "graduate"), token_index(tokens, "university", 1)),
+            DependencyEdge("university", "coref", "university", token_index(tokens, "university", 1), token_index(tokens, "university", 2)),
+            DependencyEdge("located", "nsubj", "university", token_index(tokens, "located"), token_index(tokens, "university", 2)),
+            DependencyEdge("located", "obl:in", "city", token_index(tokens, "located"), token_index(tokens, "city")),
+        ]
+
+        anchor_graph = GraphBuilder().build_anchor_graph(DependencyParse(tokens, edges), anchor_extraction)
+        ast = ASTBuilder(FakeLLM("BRIDGE")).build(question, anchor_extraction, replacement, anchor_graph)
+        path = nx.shortest_path(ast.graph, "EntityAlpha", "CityAlpha")
+
+        self.assertEqual(
+            [ast.display_label(node) for node in path],
+            ["AlphaGo", "the artificial intelligence company", "CEO", "university", "city"],
+        )
+
+        one_hop_llm = FakeLLM()
+        SubquestionGenerator(one_hop_llm).generate(question, ast, anchor_extraction)
+        joined_prompts = "\n".join(one_hop_llm.one_hop_prompts)
+        self.assertIn("AlphaGo", joined_prompts)
+        self.assertIn("the artificial intelligence company", joined_prompts)
 
     def test_serial_question_uses_original_parse_and_generates_university_city_hops(self) -> None:
         question = (

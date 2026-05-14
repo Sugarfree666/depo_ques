@@ -48,6 +48,13 @@ class PlaceholderReplacement:
     question: str
     mapping: dict[str, str]
     replacements: list[dict[str, Any]] = field(default_factory=list)
+    mask_mapping: dict[str, dict[str, Any]] = field(default_factory=dict)
+    preserved_type_variables: list[dict[str, Any]] = field(default_factory=list)
+    anchor_extraction: ExtractionResult | None = None
+
+    @property
+    def masked_question(self) -> str:
+        return self.question
 
 
 @dataclass

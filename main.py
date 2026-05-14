@@ -107,16 +107,18 @@ def run_pipeline(
     subquestion_generator: "SubquestionGenerator",
     debug: bool = False,
 ) -> dict[str, Any]:
-    from placeholder import replace_with_placeholders
+    from placeholder import selective_entity_masking
 
     extraction = extractor.extract(record.question)
-    replacement = replace_with_placeholders(record.question, extraction)
-    dependency_parse = parser.parse(record.question)
-    anchor_graph = graph_builder.build_anchor_graph(dependency_parse, extraction)
-    ast = ast_builder.build(record.question, extraction, replacement, anchor_graph)
-    subquestions = subquestion_generator.generate(record.question, ast, extraction)
+    replacement = selective_entity_masking(record.question, extraction)
+    anchor_extraction = replacement.anchor_extraction or extraction
+    dependency_parse = parser.parse(replacement.masked_question)
+    anchor_graph = graph_builder.build_anchor_graph(dependency_parse, anchor_extraction)
+    ast = ast_builder.build(record.question, anchor_extraction, replacement, anchor_graph)
+    subquestions = subquestion_generator.generate(record.question, ast, anchor_extraction)
     return {
         "extraction": extraction,
+        "anchor_extraction": anchor_extraction,
         "replacement": replacement,
         "dependency_parse": dependency_parse,
         "anchor_graph": anchor_graph,
@@ -129,6 +131,7 @@ def print_result(index: int, record: QuestionRecord, result: dict[str, Any], deb
     from graph_builder import format_dependency_edges, format_graph_lines
 
     extraction: ExtractionResult = result["extraction"]
+    anchor_extraction: ExtractionResult = result.get("anchor_extraction", extraction)
     replacement: PlaceholderReplacement = result["replacement"]
     dependency_parse = result["dependency_parse"]
     anchor_graph = result["anchor_graph"]
@@ -156,12 +159,22 @@ def print_result(index: int, record: QuestionRecord, result: dict[str, Any], deb
     _print_nodes(extraction.type_variables)
     print()
 
-    print("[2. Placeholder Question]")
+    print("[2. Selective Masked Question]")
     print(replacement.question)
     print()
-    print("Placeholder Mapping:")
-    for placeholder, text in replacement.mapping.items():
-        print(f"  - {placeholder}: {text}")
+    print("Mask Mapping:")
+    if replacement.mask_mapping:
+        for placeholder, info in replacement.mask_mapping.items():
+            print(f"  - {placeholder}: {info.get('text')} ({info.get('semantic_type')})")
+    else:
+        print("  (no complex entities masked)")
+    print()
+    print("Preserved Type Variables:")
+    if replacement.preserved_type_variables:
+        for item in replacement.preserved_type_variables:
+            print(f"  - {item.get('placeholder')}: {item.get('text')}")
+    else:
+        print("  (none)")
     print()
 
     print("[3. Dependency Graph: Enhanced++]")
@@ -185,7 +198,7 @@ def print_result(index: int, record: QuestionRecord, result: dict[str, Any], deb
     print()
 
     print("[5. Anchor MST / Anchor Graph]")
-    entity_nodes = [node.placeholder for node in extraction.entities]
+    entity_nodes = [node.placeholder for node in anchor_extraction.entities]
     for line in format_graph_lines(anchor_graph.graph, entity_nodes=entity_nodes):
         print(line)
     print()
@@ -238,9 +251,12 @@ def print_result(index: int, record: QuestionRecord, result: dict[str, Any], deb
                 )
         debug_payload = {
             "original_question": record.question,
+            "masked_question": replacement.masked_question,
             "placeholder_mapping": replacement.mapping,
+            "mask_mapping": replacement.mask_mapping,
+            "preserved_type_variables": replacement.preserved_type_variables,
             "placeholder_replacements": replacement.replacements,
-            "original_dependency_edges": [
+            "masked_dependency_edges": [
                 {
                     "source": edge.source,
                     "relation": edge.relation,

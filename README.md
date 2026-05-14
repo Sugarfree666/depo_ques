@@ -5,14 +5,18 @@ This project implements the DEPO pipeline described in `depo.md`.
 Current architecture:
 
 1. extract entities and type variables with placeholders and character spans
-2. parse the original unmodified question with Stanford CoreNLP Enhanced++
-3. align extracted spans to CoreNLP tokens
-4. fold each entity/type-variable span into a placeholder supernode
-5. build an anchor-only MST over placeholder anchors
-6. add only allowed AST operators
-7. generate atomic subquestions from adjacent one-hop AST edges
+2. selectively mask only complex long entities, such as film/book/work titles, as EntityA/EntityB
+3. parse the masked natural-language question with Stanford CoreNLP Enhanced++
+4. align masked entity spans and preserved type-variable spans to CoreNLP tokens
+5. fold each entity/type-variable span into an anchor supernode
+6. build an anchor-only MST over entity/type-variable anchors
+7. add only allowed AST operators
+8. generate atomic subquestions from adjacent one-hop AST edges
 
-Placeholders are not sent to CoreNLP. They are used for display, mapping, folded anchor nodes, and AST labels.
+Only selective masks are sent to CoreNLP. Type variables such as `director`, `film`, `CEO`,
+`university`, `company`, and `city` remain in the parsed question so the dependency
+parser keeps the natural syntactic scaffold. AST labels and generated subquestions map
+EntityA/EntityB back to the original entity names.
 
 ## Install
 
@@ -67,4 +71,3 @@ The minimal tests use mocked `DependencyParse` objects and do not require a live
 ```powershell
 python -m unittest tests.test_late_binding_graph
 ```
-
