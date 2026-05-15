@@ -76,7 +76,7 @@ class DependencyEdge:
     target_index: int
 
     def display(self) -> str:
-        return f"{self.source} --{self.relation}--> {self.target}"
+        return f"{_token_label(self.source, self.source_index)} --{self.relation}--> {_token_label(self.target, self.target_index)}"
 
 
 @dataclass
@@ -84,6 +84,12 @@ class DependencyParse:
     tokens: list[CoreNLPToken]
     edges: list[DependencyEdge]
     raw: dict[str, Any] | None = None
+
+
+def _token_label(word: str, index: int) -> str:
+    if index <= 0:
+        return word
+    return f"{word}[{index}]"
 
 
 @dataclass

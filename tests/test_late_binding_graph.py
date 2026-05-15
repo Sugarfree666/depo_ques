@@ -64,6 +64,11 @@ def span(question: str, text: str, occurrence: int = 1) -> tuple[int, int]:
 
 
 class LateBindingGraphTests(unittest.TestCase):
+    def test_dependency_edge_display_includes_token_indices(self) -> None:
+        edge = DependencyEdge("share", "nsubj", "director", 4, 2)
+
+        self.assertEqual(edge.display(), "share[4] --nsubj--> director[2]")
+
     def test_selective_masking_masks_complex_films_and_preserves_type_variables(self) -> None:
         question = (
             "Do director of film Ten9Eight: Shoot For The Moon and director of film "
@@ -87,11 +92,11 @@ class LateBindingGraphTests(unittest.TestCase):
 
         self.assertEqual(
             replacement.masked_question,
-            "Do director of film EntityA and director of film EntityB share the same nationality?",
+            "Do director of film MovieA and director of film MovieB share the same nationality?",
         )
-        self.assertEqual(set(replacement.mask_mapping), {"EntityA", "EntityB"})
-        self.assertEqual(replacement.mask_mapping["EntityA"]["text"], "Ten9Eight: Shoot For The Moon")
-        self.assertEqual(replacement.mask_mapping["EntityB"]["text"], "Sabotage (1936 Film)")
+        self.assertEqual(set(replacement.mask_mapping), {"MovieA", "MovieB"})
+        self.assertEqual(replacement.mask_mapping["MovieA"]["text"], "Ten9Eight: Shoot For The Moon")
+        self.assertEqual(replacement.mask_mapping["MovieB"]["text"], "Sabotage (1936 Film)")
 
         preserved_texts = [item["text"] for item in replacement.preserved_type_variables]
         self.assertEqual(preserved_texts, ["director", "film", "director", "film", "nationality"])
@@ -99,11 +104,61 @@ class LateBindingGraphTests(unittest.TestCase):
         anchor_extraction = replacement.anchor_extraction
         self.assertIsNotNone(anchor_extraction)
         assert anchor_extraction is not None
-        self.assertEqual([node.placeholder for node in anchor_extraction.entities], ["EntityA", "EntityB"])
+        self.assertEqual([node.placeholder for node in anchor_extraction.entities], ["MovieA", "MovieB"])
         for node in anchor_extraction.entities:
             self.assertEqual(replacement.masked_question[node.start : node.end], node.placeholder)
         for node in anchor_extraction.type_variables:
             self.assertEqual(replacement.masked_question[node.start : node.end].lower(), node.text.lower())
+
+    def test_selective_masking_masks_complex_type_phrase_with_pos_hint(self) -> None:
+        question = (
+            "Which university did the CEO of the artificial intelligence company that developed "
+            "AlphaGo graduate from?"
+        )
+        extraction = ExtractionResult(
+            entities=[
+                ExtractedNode("EntityAlpha", "AlphaGo", "entity", "Entity", *span(question, "AlphaGo")),
+            ],
+            type_variables=[
+                ExtractedNode("UniversityAlpha", "university", "type_variable", "University", *span(question, "university")),
+                ExtractedNode("PersonAlpha", "CEO", "type_variable", "Person", *span(question, "CEO")),
+                ExtractedNode("CompanyAlpha", "company", "type_variable", "Company", *span(question, "company")),
+            ],
+        )
+
+        replacement = selective_entity_masking(question, extraction)
+
+        self.assertEqual(
+            replacement.masked_question,
+            "Which university did the CEO of the CompanyA that developed AlphaGo graduate from?",
+        )
+        self.assertEqual(replacement.mask_mapping["CompanyA"]["text"], "artificial intelligence company")
+        preserved_texts = [item["text"] for item in replacement.preserved_type_variables]
+        self.assertEqual(preserved_texts, ["university", "CEO"])
+
+    def test_selective_masking_masks_multi_token_type_phrase_with_pos_hint(self) -> None:
+        question = (
+            "What region is known for its robust distribution network for local food and has "
+            "a college operating a farm for over a hundred years?"
+        )
+        extraction = ExtractionResult(
+            type_variables=[
+                ExtractedNode("RegionAlpha", "region", "type_variable", "Region", *span(question, "region")),
+                ExtractedNode("NetworkAlpha", "distribution network", "type_variable", "Network", *span(question, "distribution network")),
+                ExtractedNode("CollegeAlpha", "college", "type_variable", "College", *span(question, "college")),
+                ExtractedNode("FarmAlpha", "farm", "type_variable", "Farm", *span(question, "farm")),
+            ],
+        )
+
+        replacement = selective_entity_masking(question, extraction)
+
+        self.assertEqual(
+            replacement.masked_question,
+            "What region is known for its robust NetworkA for local food and has a college operating a farm for over a hundred years?",
+        )
+        self.assertEqual(replacement.mask_mapping["NetworkA"]["text"], "distribution network")
+        preserved_texts = [item["text"] for item in replacement.preserved_type_variables]
+        self.assertEqual(preserved_texts, ["region", "college", "farm"])
 
     def test_duplicate_surface_span_repair_assigns_second_director(self) -> None:
         question = (
@@ -146,10 +201,10 @@ class LateBindingGraphTests(unittest.TestCase):
         tokens = make_tokens(replacement.masked_question)
         edges = [
             DependencyEdge("director", "nmod:of", "film", token_index(tokens, "director", 1), token_index(tokens, "film", 1)),
-            DependencyEdge("film", "appos", "EntityA", token_index(tokens, "film", 1), token_index(tokens, "EntityA")),
+            DependencyEdge("film", "appos", "MovieA", token_index(tokens, "film", 1), token_index(tokens, "MovieA")),
             DependencyEdge("director", "obj", "nationality", token_index(tokens, "director", 1), token_index(tokens, "nationality")),
             DependencyEdge("director", "nmod:of", "film", token_index(tokens, "director", 2), token_index(tokens, "film", 2)),
-            DependencyEdge("film", "appos", "EntityB", token_index(tokens, "film", 2), token_index(tokens, "EntityB")),
+            DependencyEdge("film", "appos", "MovieB", token_index(tokens, "film", 2), token_index(tokens, "MovieB")),
             DependencyEdge("director", "obj", "nationality", token_index(tokens, "director", 2), token_index(tokens, "nationality")),
         ]
 
@@ -157,13 +212,13 @@ class LateBindingGraphTests(unittest.TestCase):
             DependencyParse(tokens, edges),
             anchor_extraction,
         )
-        self.assertEqual(set(anchor_graph.graph.nodes), {"EntityA", "EntityB", "PersonAlpha", "PersonBeta", "NationalityAlpha"})
+        self.assertEqual(set(anchor_graph.graph.nodes), {"MovieA", "MovieB", "PersonAlpha", "PersonBeta", "NationalityAlpha"})
 
         fake_llm = FakeLLM("COMPARE_SAME", ["NationalityAlpha"])
         ast = ASTBuilder(fake_llm).build(question, anchor_extraction, replacement, anchor_graph)
 
-        self.assertEqual(ast.display_label("EntityA"), "Ten9Eight: Shoot For The Moon")
-        self.assertEqual(ast.display_label("EntityB"), "Sabotage (1936 Film)")
+        self.assertEqual(ast.display_label("MovieA"), "Ten9Eight: Shoot For The Moon")
+        self.assertEqual(ast.display_label("MovieB"), "Sabotage (1936 Film)")
         self.assertTrue(ast.graph.has_edge("NationalityAlpha", "COMPARE_SAME"))
 
     def test_compare_question_folds_fragmented_films_and_keeps_repeated_directors(self) -> None:
@@ -232,18 +287,21 @@ class LateBindingGraphTests(unittest.TestCase):
         )
 
         replacement = selective_entity_masking(question, extraction)
-        self.assertEqual(replacement.masked_question, question)
-        self.assertEqual(replacement.mask_mapping, {})
+        self.assertEqual(
+            replacement.masked_question,
+            "Which university did the CEO of the CompanyA that developed AlphaGo graduate from and in which city is this university located?",
+        )
+        self.assertEqual(set(replacement.mask_mapping), {"CompanyA"})
         preserved_texts = {item["text"] for item in replacement.preserved_type_variables}
-        self.assertEqual(preserved_texts, {"university", "CEO", "the artificial intelligence company", "city"})
+        self.assertEqual(preserved_texts, {"university", "CEO", "city"})
 
         anchor_extraction = replacement.anchor_extraction
         self.assertIsNotNone(anchor_extraction)
         assert anchor_extraction is not None
         tokens = make_tokens(replacement.masked_question)
         edges = [
-            DependencyEdge("company", "acl", "AlphaGo", token_index(tokens, "company"), token_index(tokens, "AlphaGo")),
-            DependencyEdge("CEO", "nmod:of", "company", token_index(tokens, "CEO"), token_index(tokens, "company")),
+            DependencyEdge("CompanyA", "acl", "AlphaGo", token_index(tokens, "CompanyA"), token_index(tokens, "AlphaGo")),
+            DependencyEdge("CEO", "nmod:of", "CompanyA", token_index(tokens, "CEO"), token_index(tokens, "CompanyA")),
             DependencyEdge("graduate", "nsubj", "CEO", token_index(tokens, "graduate"), token_index(tokens, "CEO")),
             DependencyEdge("graduate", "obl:from", "university", token_index(tokens, "graduate"), token_index(tokens, "university", 1)),
             DependencyEdge("university", "coref", "university", token_index(tokens, "university", 1), token_index(tokens, "university", 2)),

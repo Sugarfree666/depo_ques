@@ -21,6 +21,107 @@ LONG_NAMED_ENTITY_TYPES = {
     "play",
     "novel",
 }
+DETERMINERS = {"the", "a", "an"}
+LEADING_FUNCTION_WORDS = {
+    *DETERMINERS,
+    "of",
+    "in",
+    "on",
+    "for",
+    "from",
+    "to",
+    "by",
+    "with",
+    "at",
+    "as",
+}
+LEFT_EXPANSION_BOUNDARIES = {
+    "and",
+    "or",
+    "but",
+    "that",
+    "which",
+    "who",
+    "whom",
+    "whose",
+    "where",
+    "when",
+    "what",
+    "did",
+    "do",
+    "does",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "has",
+    "have",
+    "had",
+    "of",
+    "in",
+    "on",
+    "for",
+    "from",
+    "to",
+    "by",
+    "with",
+    "at",
+    "as",
+}
+NONESSENTIAL_PREMODIFIERS = {
+    "same",
+    "robust",
+    "local",
+    "major",
+    "minor",
+    "large",
+    "small",
+    "old",
+    "new",
+    "famous",
+    "known",
+    "notable",
+}
+RELATIVE_OR_COMPLEMENT_BOUNDARIES = {
+    "that",
+    "which",
+    "who",
+    "whom",
+    "whose",
+    "where",
+    "when",
+}
+POS_HINT_BASE_BY_TYPE = {
+    "business": "Company",
+    "company": "Company",
+    "corporation": "Company",
+    "organisation": "Organization",
+    "organization": "Organization",
+    "ceo": "Person",
+    "director": "Person",
+    "founder": "Person",
+    "person": "Person",
+    "people": "Person",
+    "film": "Movie",
+    "movie": "Movie",
+    "book": "Book",
+    "novel": "Book",
+    "album": "Album",
+    "song": "Song",
+    "university": "Institution",
+    "college": "Institution",
+    "school": "Institution",
+    "city": "City",
+    "country": "Country",
+    "region": "Region",
+    "network": "Network",
+    "system": "System",
+    "structure": "Structure",
+    "farm": "Artifact",
+}
 
 
 @dataclass(frozen=True)
@@ -46,11 +147,11 @@ def selective_entity_masking(
     original_question: str,
     extracted_nodes: ExtractionResult | dict[str, Any],
 ) -> PlaceholderReplacement:
-    """Mask only complex named entities and preserve type variables in the sentence.
+    """Mask complex noun phrases while preserving the syntactic scaffold.
 
     The returned ``anchor_extraction`` is aligned to the masked question: masked
-    entities use EntityA/EntityB anchor ids, while all type-variable anchors stay
-    unmasked with shifted character spans.
+    noun phrases use POS-hinting anchor ids such as CompanyA/MovieA, while simple
+    entity/type-variable anchors stay unmasked with shifted character spans.
     """
 
     extraction = _coerce_extraction(original_question, extracted_nodes)
@@ -71,9 +172,13 @@ def selective_entity_masking(
         candidates=candidates,
     )
     mask_mapping = _build_mask_mapping(candidates)
+    masked_type_node_ids = {
+        id(candidate.node) for candidate in candidates if candidate.node.is_type_variable
+    }
     preserved_type_variables = _build_preserved_type_variables(
         original_nodes=extraction.type_variables,
         masked_nodes=anchor_extraction.type_variables,
+        masked_original_node_ids=masked_type_node_ids,
     )
 
     mapping = {node.placeholder: node.text for node in anchor_extraction.nodes}
@@ -224,12 +329,11 @@ def _coerce_node_list(question: str, raw_nodes: Any, kind: str) -> list[Extracte
 
 def _select_mask_candidates(question: str, extraction: ExtractionResult) -> list[_MaskCandidate]:
     candidates: list[_MaskCandidate] = []
-    for node in extraction.entities:
-        if not _is_complex_entity(node):
+    for node in extraction.nodes:
+        candidate_span = _maskable_noun_phrase_span(question, node)
+        if candidate_span is None:
             continue
-        start, end = _resolve_node_span(question, node.text, node.start, node.end, node.occurrence)
-        if start is None or end is None or not (0 <= start < end <= len(question)):
-            continue
+        start, end = candidate_span
         candidates.append(
             _MaskCandidate(
                 node=node,
@@ -241,32 +345,54 @@ def _select_mask_candidates(question: str, extraction: ExtractionResult) -> list
     return _remove_overlapping_candidates(candidates)
 
 
-def _is_complex_entity(node: ExtractedNode) -> bool:
-    if not node.is_entity:
+def _maskable_noun_phrase_span(question: str, node: ExtractedNode) -> tuple[int, int] | None:
+    start, end = _resolve_node_span(question, node.text, node.start, node.end, node.occurrence)
+    if start is None or end is None or not (0 <= start < end <= len(question)):
+        return None
+
+    start, end = _trim_right_at_clause_boundary(question, start, end)
+    if node.is_type_variable and _token_count(question[start:end]) <= 1:
+        start = _expand_left_premodifiers(question, start)
+    start, end = _trim_leading_mask_preserved_words(question, start, end, node)
+    start, end = _trim_outer_whitespace(question, start, end)
+
+    if start is None or end is None or not (0 <= start < end <= len(question)):
+        return None
+    if not _is_complex_noun_phrase(question[start:end], node):
+        return None
+    return start, end
+
+
+def _is_complex_noun_phrase(text: str, node: ExtractedNode) -> bool:
+    stripped = text.strip()
+    token_count = _token_count(stripped)
+    if token_count <= 0:
         return False
 
-    text = node.text.strip()
-    token_count = len(re.findall(r"[A-Za-z0-9]+", text))
     semantic_type = node.semantic_type.strip().lower()
-    has_complex_punctuation = bool(COMPLEX_ENTITY_PATTERN.search(text))
-    is_long_named_entity_type = any(item in semantic_type for item in LONG_NAMED_ENTITY_TYPES)
-    return has_complex_punctuation or token_count >= 3 or (
-        is_long_named_entity_type and token_count >= 2 and len(text) >= 12
-    )
+    has_complex_punctuation = bool(COMPLEX_ENTITY_PATTERN.search(stripped))
+    if node.is_entity:
+        is_long_named_entity_type = any(item in semantic_type for item in LONG_NAMED_ENTITY_TYPES)
+        return has_complex_punctuation or token_count >= 3 or (
+            is_long_named_entity_type and token_count >= 2 and len(stripped) >= 12
+        )
+
+    return has_complex_punctuation or token_count >= 2
 
 
 def _assign_entity_masks(candidates: list[_MaskCandidate], extraction: ExtractionResult) -> None:
     candidate_ids = {id(candidate.node) for candidate in candidates}
     reserved = {node.placeholder for node in extraction.nodes if id(node) not in candidate_ids}
-    next_index = 0
+    counters: dict[str, int] = {}
     for candidate in sorted(candidates, key=lambda item: item.start):
-        mask = _entity_mask_label(next_index)
+        base = _pos_hint_base(candidate.node)
+        mask = _pos_hint_label(base, counters.get(base, 0))
         while mask in reserved:
-            next_index += 1
-            mask = _entity_mask_label(next_index)
+            counters[base] = counters.get(base, 0) + 1
+            mask = _pos_hint_label(base, counters[base])
         candidate.mask = mask
         reserved.add(mask)
-        next_index += 1
+        counters[base] = counters.get(base, 0) + 1
 
 
 def _compute_masked_spans(candidates: list[_MaskCandidate]) -> None:
@@ -310,6 +436,18 @@ def _build_anchor_extraction(
 
     type_variables: list[ExtractedNode] = []
     for node in extraction.type_variables:
+        candidate = candidate_by_node_id.get(id(node))
+        if candidate is not None:
+            type_variables.append(
+                replace(
+                    node,
+                    placeholder=candidate.mask,
+                    start=candidate.masked_start,
+                    end=candidate.masked_end,
+                    occurrence=1,
+                )
+            )
+            continue
         start, end = _translate_or_find_span(
             original_question=original_question,
             masked_question=masked_question,
@@ -326,6 +464,7 @@ def _build_mask_mapping(candidates: list[_MaskCandidate]) -> dict[str, dict[str,
     for candidate in sorted(candidates, key=lambda item: item.start):
         result[candidate.mask] = {
             "text": candidate.original_text,
+            "node_text": candidate.node.text,
             "type": candidate.node.semantic_type,
             "semantic_type": candidate.node.semantic_type,
             "kind": candidate.node.kind,
@@ -339,9 +478,13 @@ def _build_mask_mapping(candidates: list[_MaskCandidate]) -> dict[str, dict[str,
 def _build_preserved_type_variables(
     original_nodes: list[ExtractedNode],
     masked_nodes: list[ExtractedNode],
+    masked_original_node_ids: set[int] | None = None,
 ) -> list[dict[str, Any]]:
+    masked_original_node_ids = masked_original_node_ids or set()
     preserved: list[dict[str, Any]] = []
     for original, masked in zip(original_nodes, masked_nodes):
+        if id(original) in masked_original_node_ids:
+            continue
         preserved.append(
             {
                 "placeholder": masked.placeholder,
@@ -353,6 +496,69 @@ def _build_preserved_type_variables(
             }
         )
     return preserved
+
+
+def _trim_right_at_clause_boundary(question: str, start: int, end: int) -> tuple[int, int]:
+    text = question[start:end]
+    for match in re.finditer(r"\b[A-Za-z][A-Za-z0-9'-]*\b", text):
+        if match.group(0).lower() in RELATIVE_OR_COMPLEMENT_BOUNDARIES:
+            return _trim_outer_whitespace(question, start, start + match.start())
+    return start, end
+
+
+def _expand_left_premodifiers(question: str, start: int) -> int:
+    current = start
+    saw_modifier = False
+    while True:
+        match = re.search(r"\b([A-Za-z][A-Za-z0-9'-]*)\s+$", question[:current])
+        if not match:
+            break
+        word = match.group(1)
+        lowered = word.lower()
+        if lowered in DETERMINERS:
+            if saw_modifier:
+                current = match.start(1)
+            break
+        if lowered in LEFT_EXPANSION_BOUNDARIES or lowered in NONESSENTIAL_PREMODIFIERS:
+            break
+        if word[:1].isupper():
+            break
+        saw_modifier = True
+        current = match.start(1)
+    return current
+
+
+def _trim_leading_mask_preserved_words(
+    question: str,
+    start: int,
+    end: int,
+    node: ExtractedNode,
+) -> tuple[int, int]:
+    current = start
+    while current < end:
+        match = re.match(r"\s*([A-Za-z][A-Za-z0-9'-]*)(\s+)", question[current:end])
+        if not match:
+            break
+        lowered = match.group(1).lower()
+        if lowered in LEADING_FUNCTION_WORDS or (
+            node.is_type_variable and lowered in NONESSENTIAL_PREMODIFIERS
+        ):
+            current += match.end()
+            continue
+        break
+    return current, end
+
+
+def _trim_outer_whitespace(question: str, start: int, end: int) -> tuple[int, int]:
+    while start < end and question[start].isspace():
+        start += 1
+    while end > start and question[end - 1].isspace():
+        end -= 1
+    return start, end
+
+
+def _token_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-z0-9]+", text))
 
 
 def _translate_or_find_span(
@@ -426,7 +632,19 @@ def _remove_overlapping_candidates(candidates: list[_MaskCandidate]) -> list[_Ma
     return result
 
 
-def _entity_mask_label(index: int) -> str:
+def _pos_hint_base(node: ExtractedNode) -> str:
+    combined = f"{node.semantic_type} {node.text}".lower()
+    for key, base in POS_HINT_BASE_BY_TYPE.items():
+        if re.search(rf"\b{re.escape(key)}\b", combined):
+            return base
+    return "SomeEntity"
+
+
+def _pos_hint_label(base: str, index: int) -> str:
+    return f"{base}{_letter_suffix(index)}"
+
+
+def _letter_suffix(index: int) -> str:
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     label = ""
     current = index
@@ -435,7 +653,7 @@ def _entity_mask_label(index: int) -> str:
         current = current // len(alphabet) - 1
         if current < 0:
             break
-    return f"Entity{label}"
+    return label
 
 
 def _fallback_placeholder(semantic_type: str, kind: str, index: int) -> str:

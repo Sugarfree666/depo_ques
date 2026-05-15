@@ -31,11 +31,16 @@ ENTITY_EXTRACTION_SYSTEM = (
     + """
 Current step: identify entity nodes and type-variable nodes only.
 Do not generate subquestions.
+Extract minimal relation-bearing anchor nodes for dependency-graph inspection, not full descriptive noun phrases.
 Assign each node a natural-language CamelCase placeholder in the format SemanticType + GreekOrdinal.
 Use Greek ordinals in this order: Alpha, Beta, Gamma, Delta, Epsilon, Zeta, Eta, Theta.
 Examples: CompanyAlpha, PersonAlpha, PersonBeta, FilmAlpha, FilmBeta, NationalityAlpha.
 Use EntityAlpha only when no more specific semantic type is natural.
 For repeated mentions with different roles, keep separate nodes with separate placeholders.
+For type variables, use the shortest surface span that still names the relation endpoint correctly.
+Prefer the head role/category for organization, institution, place, person, and title endpoints.
+Keep pre-head words only when they form an essential functional/common-noun term; remove field, topic, quality, domain, purpose, or scope modifiers.
+Do not omit a functional/structural nominal endpoint just because it is introduced as an attributed property or predicate complement.
 Return exact character spans in the original question whenever possible, using Python-style start inclusive and end exclusive.
 These original spans will be shifted after selective masking and then aligned to CoreNLP tokens, so span accuracy is critical.
 """
@@ -46,21 +51,21 @@ def build_entity_extraction_prompt(question: str) -> str:
     schema = {
         "entities": [
             {
-                "text": "AlphaGo",
+                "text": "NamedEntity",
                 "semantic_type": "Entity",
                 "placeholder": "EntityAlpha",
                 "start": 0,
-                "end": 7,
+                "end": 11,
                 "occurrence": 1,
             }
         ],
         "type_variables": [
             {
-                "text": "the artificial intelligence company",
+                "text": "company",
                 "semantic_type": "Company",
                 "placeholder": "CompanyAlpha",
                 "start": 0,
-                "end": 35,
+                "end": 7,
                 "occurrence": 1,
             }
         ],
@@ -69,14 +74,24 @@ def build_entity_extraction_prompt(question: str) -> str:
 Extract only the core entity and type-variable nodes for this question.
 
 Definitions:
-- entity: a concrete named entity or named artifact, such as AlphaGo, Ten9Eight: Shoot For The Moon, Sabotage (1936 Film).
-- type_variable: a category, role, concept, or answer type in the question, such as CEO, director, university, city, nationality.
+- entity: a concrete named entity or named artifact explicitly named in the question.
+- type_variable: a minimal role, title, office, answer type, object type, institution type, system, artifact, place type, or other common-noun concept that acts as an endpoint in the question's relation chain.
 
 Rules:
 - Do not generate atomic subquestions.
 - Do not output relations.
 - Do not invent nodes not explicitly supported by the question text.
-- Keep duplicate role variables separate when they belong to different branches, such as two directors in a comparison.
+- Extract only relation-bearing graph anchors: named entities, answer types, roles/titles/offices, institutions, places, systems, artifacts, and object/category concepts that are endpoints of predicates, possessives, clauses, or prepositional relations.
+- Always include explicit role/title/office mentions when they participate in a relation, including abbreviations and uppercase titles. Do not drop a role just because it is attached to another node by a possessive, "of", or relative-clause relation.
+- For each type_variable, choose the shortest contiguous span that still names the endpoint correctly. Remove determiners and nonessential adjectives.
+- Include nominal predicate complements and attributed/possessed things when they are themselves functional, structural, institutional, artifact, system, place, or role endpoints in the relation chain. They remain anchors even if the surrounding clause describes a property of another node.
+- For organization, institution, place, person, and role/title endpoints, the head category or title is normally the node. Remove preceding field, industry, topic, domain, quality, purpose, scope, and descriptive modifiers unless the whole phrase is a proper named entity.
+- For functional or structural common-noun endpoints, keep a compact compound span only when the pre-head word changes the endpoint class and the head alone would be too vague for the relation chain. Keep only essential compound words; remove determiners, quality adjectives, clauses, and prepositional complements.
+- If a word or phrase only describes, restricts, classifies, quantifies, dates, measures, or gives the topic/domain/purpose of another anchor, do not extract it as a standalone node unless the question directly asks for that value. This pruning applies to the modifiers and complements around an anchor, not to the anchor noun phrase itself.
+- Do not extract objects inside modifier/complement phrases as separate nodes when they are only topical restrictions or purposes of another endpoint.
+- Do not extract quantities, durations, dates, ordinals, comparative words, or measurement phrases as standalone nodes unless the question directly asks for that value as the answer.
+- Before returning, prune every multi-word type_variable span: if removing a pre-head word leaves a valid role/category endpoint of the same relation, output the shorter span; if removing it changes a functional/structural endpoint into a vague generic noun, keep the compact compound.
+- Keep duplicate role variables separate when they belong to different branches or distinct mentions with different roles.
 - Preserve exact surface text from the original question.
 - Return accurate start/end character offsets for each surface span in the original question.
 - Prefer semantic placeholders like PersonAlpha for CEO/director, FilmAlpha for films, CompanyAlpha for companies.

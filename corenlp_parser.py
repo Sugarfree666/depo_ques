@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -43,24 +45,25 @@ class CoreNLPParser:
         if self.client is not None:
             return
         try:
-            from stanza.server import CoreNLPClient
+            with _suppress_info_logs():
+                from stanza.server import CoreNLPClient
 
-            corenlp_home = self._resolve_corenlp_home()
-            client_kwargs: dict[str, Any] = {}
-            if corenlp_home is not None:
-                client_kwargs["classpath"] = self._build_classpath(corenlp_home)
+                corenlp_home = self._resolve_corenlp_home()
+                client_kwargs: dict[str, Any] = {}
+                if corenlp_home is not None:
+                    client_kwargs["classpath"] = self._build_classpath(corenlp_home)
 
-            self._client_manager = CoreNLPClient(
-                endpoint=self.url,
-                annotators="tokenize,ssplit,pos,lemma,depparse",
-                output_format="json",
-                properties=self.properties,
-                timeout=self.timeout_ms,
-                memory=self.memory,
-                be_quiet=self.be_quiet,
-                **client_kwargs,
-            )
-            self.client = self._client_manager.__enter__()
+                self._client_manager = CoreNLPClient(
+                    endpoint=self.url,
+                    annotators="tokenize,ssplit,pos,lemma,depparse",
+                    output_format="json",
+                    properties=self.properties,
+                    timeout=self.timeout_ms,
+                    memory=self.memory,
+                    be_quiet=self.be_quiet,
+                    **client_kwargs,
+                )
+                self.client = self._client_manager.__enter__()
         except ModuleNotFoundError:
             raise
         except Exception as exc:
@@ -204,3 +207,13 @@ class CoreNLPParser:
             token_offset += len(sentence.get("tokens", []))
 
         return DependencyParse(tokens=tokens, edges=edges, raw=payload)
+
+
+@contextmanager
+def _suppress_info_logs() -> Any:
+    previous_disable = logging.root.manager.disable
+    logging.disable(logging.INFO)
+    try:
+        yield
+    finally:
+        logging.disable(previous_disable)

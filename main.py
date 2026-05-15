@@ -1,25 +1,21 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from typing import TYPE_CHECKING, Any
 
 from io_utils import read_questions
-from models import ASTResult, AtomicSubquestion, ExtractionResult, PlaceholderReplacement, QuestionRecord
+from models import ExtractionResult, PlaceholderReplacement, QuestionRecord
 
 if TYPE_CHECKING:
-    from ast_builder import ASTBuilder
     from corenlp_parser import CoreNLPParser
     from entity_extractor import EntityExtractor
-    from graph_builder import GraphBuilder
-    from subquestion_generator import SubquestionGenerator
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="DEPO one-hop atomic subquestion decomposition using entity/type-variable relation graphs."
+        description="Inspect CoreNLP Enhanced++ dependency graphs after entity extraction and selective masking."
     )
     parser.add_argument("--question", help="Run one manually supplied question instead of questions.json.")
     parser.add_argument("--questions-file", default="questions.json", help="Path to questions.json.")
@@ -41,7 +37,7 @@ def parse_args() -> argparse.Namespace:
         default=60000,
         help="CoreNLP annotation timeout in milliseconds.",
     )
-    parser.add_argument("--debug", action="store_true", help="Print additional intermediate structures.")
+    parser.add_argument("--debug", action="store_true", help="Accepted for compatibility; output still stops at dependency edges.")
     return parser.parse_args()
 
 
@@ -56,18 +52,12 @@ def main() -> int:
     records = [QuestionRecord(question=args.question)] if args.question else read_questions(args.questions_file)
 
     try:
-        from ast_builder import ASTBuilder
         from corenlp_parser import CoreNLPConnectionError, CoreNLPParser
         from entity_extractor import EntityExtractor
-        from graph_builder import AnchorGraphError, GraphBuilder
         from llm_client import LLMClient
-        from subquestion_generator import SubquestionGenerator
 
         llm_client = LLMClient(api_key=api_key, base_url=base_url, model="gpt-4o-mini")
         extractor = EntityExtractor(llm_client)
-        graph_builder = GraphBuilder()
-        ast_builder = ASTBuilder(llm_client)
-        subquestion_generator = SubquestionGenerator(llm_client)
 
         with CoreNLPParser(
             args.corenlp_url,
@@ -81,16 +71,13 @@ def main() -> int:
                     index=index,
                     extractor=extractor,
                     parser=parser,
-                    graph_builder=graph_builder,
-                    ast_builder=ast_builder,
-                    subquestion_generator=subquestion_generator,
                     debug=args.debug,
                 )
                 print_result(index, record, result, debug=args.debug)
     except ModuleNotFoundError as exc:
         print(f"Missing dependency: {exc.name}. Run: pip install -r requirements.txt", file=sys.stderr)
         return 2
-    except (CoreNLPConnectionError, AnchorGraphError, RuntimeError, ValueError) as exc:
+    except (CoreNLPConnectionError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
@@ -102,41 +89,24 @@ def run_pipeline(
     index: int,
     extractor: "EntityExtractor",
     parser: "CoreNLPParser",
-    graph_builder: "GraphBuilder",
-    ast_builder: "ASTBuilder",
-    subquestion_generator: "SubquestionGenerator",
     debug: bool = False,
 ) -> dict[str, Any]:
     from placeholder import selective_entity_masking
 
     extraction = extractor.extract(record.question)
     replacement = selective_entity_masking(record.question, extraction)
-    anchor_extraction = replacement.anchor_extraction or extraction
     dependency_parse = parser.parse(replacement.masked_question)
-    anchor_graph = graph_builder.build_anchor_graph(dependency_parse, anchor_extraction)
-    ast = ast_builder.build(record.question, anchor_extraction, replacement, anchor_graph)
-    subquestions = subquestion_generator.generate(record.question, ast, anchor_extraction)
     return {
         "extraction": extraction,
-        "anchor_extraction": anchor_extraction,
         "replacement": replacement,
         "dependency_parse": dependency_parse,
-        "anchor_graph": anchor_graph,
-        "ast": ast,
-        "subquestions": subquestions,
     }
 
 
 def print_result(index: int, record: QuestionRecord, result: dict[str, Any], debug: bool = False) -> None:
-    from graph_builder import format_dependency_edges, format_graph_lines
-
     extraction: ExtractionResult = result["extraction"]
-    anchor_extraction: ExtractionResult = result.get("anchor_extraction", extraction)
     replacement: PlaceholderReplacement = result["replacement"]
     dependency_parse = result["dependency_parse"]
-    anchor_graph = result["anchor_graph"]
-    ast: ASTResult = result["ast"]
-    subquestions: list[AtomicSubquestion] = result["subquestions"]
 
     separator = "=" * 60
     print(separator)
@@ -179,108 +149,13 @@ def print_result(index: int, record: QuestionRecord, result: dict[str, Any], deb
 
     print("[3. Dependency Graph: Enhanced++]")
     print("Edges:")
-    edge_lines = format_dependency_edges(dependency_parse)
+    edge_lines = _format_dependency_edges(dependency_parse)
     if edge_lines:
         for line in edge_lines:
             print(line)
     else:
         print("  (no dependency edges)")
     print()
-
-    print("[4. Folded Dependency Graph]")
-    print("Edges:")
-    folded_edge_lines = _format_folded_dependency_edges(anchor_graph)
-    if folded_edge_lines:
-        for line in folded_edge_lines:
-            print(line)
-    else:
-        print("  (no folded dependency edges)")
-    print()
-
-    print("[5. Anchor MST / Anchor Graph]")
-    entity_nodes = [node.placeholder for node in anchor_extraction.entities]
-    for line in format_graph_lines(anchor_graph.graph, entity_nodes=entity_nodes):
-        print(line)
-    print()
-
-    print("[6. Final AST]")
-    operator_nodes = [
-        node for node, attrs in ast.graph.nodes(data=True) if attrs.get("kind") == "operator"
-    ]
-    for line in format_graph_lines(
-        ast.graph,
-        label_func=ast.display_label,
-        entity_nodes=entity_nodes,
-        operator_nodes=operator_nodes,
-    ):
-        print(line)
-    print()
-    print("Operators:")
-    if ast.operators:
-        for operator in ast.operators:
-            attach = f" (attach_to: {', '.join(operator.attach_to)})" if operator.attach_to else ""
-            print(f"  - {operator.operator}{attach}")
-    else:
-        print("  - NONE")
-    print()
-
-    print("[7. Atomic Subquestions]")
-    if not subquestions:
-        print("  (no atomic subquestions generated)")
-    for item in subquestions:
-        print(f"  q{item.index}: {item.question}")
-        if item.answer_variable:
-            print(f"      answer: {item.answer_variable}")
-        print()
-
-    if debug:
-        print("[Debug]")
-        folded_edges = []
-        if anchor_graph.folded_graph is not None:
-            for source, target, attrs in anchor_graph.folded_graph.edges(data=True):
-                folded_edges.append(
-                    {
-                        "source": source,
-                        "target": target,
-                        "relations": attrs.get("relations", []),
-                        "path_words": [
-                            anchor_graph.folded_graph.nodes[source].get("word", source),
-                            anchor_graph.folded_graph.nodes[target].get("word", target),
-                        ],
-                    }
-                )
-        debug_payload = {
-            "original_question": record.question,
-            "masked_question": replacement.masked_question,
-            "placeholder_mapping": replacement.mapping,
-            "mask_mapping": replacement.mask_mapping,
-            "preserved_type_variables": replacement.preserved_type_variables,
-            "placeholder_replacements": replacement.replacements,
-            "masked_dependency_edges": [
-                {
-                    "source": edge.source,
-                    "relation": edge.relation,
-                    "target": edge.target,
-                    "source_index": edge.source_index,
-                    "target_index": edge.target_index,
-                }
-                for edge in dependency_parse.edges
-            ],
-            "anchor_positions": anchor_graph.anchor_positions,
-            "folded_dependency_edges": folded_edges,
-            "anchor_edges": [
-                {
-                    "source": edge.source,
-                    "target": edge.target,
-                    "weight": edge.weight,
-                    "path_words": edge.path_words,
-                    "relations": edge.relations,
-                }
-                for edge in anchor_graph.edges
-            ],
-        }
-        print(json.dumps(debug_payload, ensure_ascii=False, indent=2))
-        print()
 
 
 def _print_nodes(nodes: list[Any]) -> None:
@@ -291,33 +166,8 @@ def _print_nodes(nodes: list[Any]) -> None:
         print(f"  - {node.placeholder}: {node.text}")
 
 
-def _format_folded_dependency_edges(anchor_graph: Any) -> list[str]:
-    folded_graph = getattr(anchor_graph, "folded_graph", None)
-    if folded_graph is None:
-        return []
-
-    lines: list[str] = []
-    for source, target, attrs in sorted(
-        folded_graph.edges(data=True),
-        key=lambda item: (
-            folded_graph.nodes[item[0]].get("order", 10**9),
-            folded_graph.nodes[item[1]].get("order", 10**9),
-            str(item[0]),
-            str(item[1]),
-        ),
-    ):
-        source_label = _folded_node_label(folded_graph, source)
-        target_label = _folded_node_label(folded_graph, target)
-        relation = "|".join(attrs.get("relations", [])) or attrs.get("relation", "")
-        lines.append(f"  - {source_label} --{relation}--> {target_label}")
-    return lines
-
-
-def _folded_node_label(graph: Any, node: Any) -> str:
-    attrs = graph.nodes[node]
-    if attrs.get("kind") in {"entity", "type_variable"}:
-        return str(node)
-    return str(attrs.get("word", node))
+def _format_dependency_edges(dependency_parse: Any) -> list[str]:
+    return [f"  - {edge.display()}" for edge in dependency_parse.edges]
 
 
 if __name__ == "__main__":
