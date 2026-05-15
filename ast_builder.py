@@ -53,7 +53,7 @@ class ASTBuilder:
 
         ast_graph = anchor_graph.graph.copy()
         for selection in operators:
-            if selection.operator in {"NONE", "BRIDGE"}:
+            if selection.operator == "NONE":
                 continue
             operator_node = self._operator_node_id(ast_graph, selection.operator)
             ast_graph.add_node(
@@ -74,7 +74,7 @@ class ASTBuilder:
             if attrs.get("kind") == "operator":
                 labels[node] = str(attrs.get("text", node))
             elif node in node_lookup:
-                labels[node] = node_lookup[node].text
+                labels.setdefault(node, node_lookup[node].text)
         return ASTResult(graph=ast_graph, operators=operators, label_by_placeholder=labels)
 
     @staticmethod
@@ -85,7 +85,7 @@ class ASTBuilder:
         for item in raw:
             if not isinstance(item, dict):
                 continue
-            operator = str(item.get("operator", "NONE")).strip().upper()
+            operator = _canonical_operator(str(item.get("operator", "NONE")).strip().upper())
             if operator not in ALLOWED_OPERATORS:
                 continue
             attach_to = item.get("attach_to", [])
@@ -127,3 +127,15 @@ class ASTBuilder:
             if type_nodes:
                 return [max(type_nodes, key=lambda node: graph.nodes[node].get("order", 0))]
         return [max(non_operator_nodes, key=lambda node: graph.degree(node))]
+
+
+def _canonical_operator(operator: str) -> str:
+    aliases = {
+        "COMPARE_DIFFERENT": "COMPARE_DIFF",
+        "AND": "LOGICAL_AND",
+        "OR": "LOGICAL_OR",
+        "BRIDGE": "NONE",
+        "COUNT": "NONE",
+        "FILTER": "NONE",
+    }
+    return aliases.get(operator, operator)

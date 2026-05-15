@@ -8,6 +8,25 @@ import networkx as nx
 
 from models import AnchorEdge, AnchorGraph, CoreNLPToken, DependencyParse, ExtractedNode, ExtractionResult
 
+LOW_WEIGHT_RELATIONS = {"nsubj", "nsubj:pass", "obj", "iobj", "ccomp", "xcomp"}
+MEDIUM_WEIGHT_BASES = {
+    "nmod",
+    "obl",
+    "amod",
+    "advmod",
+    "nummod",
+    "compound",
+    "acl",
+    "advcl",
+    "case",
+    "mark",
+    "aux",
+    "cop",
+}
+MEDIUM_WEIGHT_RELATIONS = {"nmod:of", "acl:relcl", "aux:pass"}
+HIGH_WEIGHT_BASES = {"conj", "cc", "det", "punct", "dep"}
+DEFAULT_RELATION_WEIGHT = 3
+
 
 class AnchorGraphError(RuntimeError):
     pass
@@ -23,45 +42,118 @@ class GraphBuilder:
         if not anchors:
             raise AnchorGraphError("No entity/type-variable anchors were extracted.")
 
-        folded_graph, anchor_positions = self._fold_dependency_graph(dependency_parse, extraction)
-        missing = [node for node in extraction.nodes if node.placeholder not in folded_graph]
+        weighted_graph = self.build_weighted_dependency_graph(dependency_parse)
+        anchor_positions = self._align_anchor_spans(dependency_parse.tokens, extraction.nodes)
+        missing = [node for node in extraction.nodes if not anchor_positions.get(node.placeholder)]
         if missing:
-            raise AnchorGraphError(_format_missing_alignment_error(missing))
+            raise AnchorGraphError(_format_missing_alignment_error(missing, anchor_positions))
 
+        closure = self._build_anchor_closure(weighted_graph, extraction.nodes, anchor_positions)
+        if closure.number_of_nodes() > 1 and not nx.is_connected(closure):
+            components = [sorted(component) for component in nx.connected_components(closure)]
+            raise AnchorGraphError(
+                "Could not connect all anchors in the weighted dependency graph. Components: "
+                + "; ".join(", ".join(component) for component in components)
+            )
+
+        anchor_subgraph = self._build_anchor_subgraph(weighted_graph, closure)
+        semantic_graph, anchor_edges = self._build_semantic_mst(closure)
+
+        return AnchorGraph(
+            graph=semantic_graph,
+            edges=anchor_edges,
+            anchor_positions=anchor_positions,
+            folded_graph=anchor_subgraph,
+            weighted_graph=weighted_graph,
+            anchor_subgraph=anchor_subgraph,
+        )
+
+    def build_weighted_dependency_graph(self, dependency_parse: DependencyParse) -> nx.Graph:
+        graph = nx.Graph()
+        tokens_by_index = {token.index: token for token in dependency_parse.tokens}
+        for token in dependency_parse.tokens:
+            graph.add_node(
+                token.index,
+                kind="token",
+                word=token.word,
+                text=token.word,
+                label=_token_label(token),
+                order=token.index,
+                character_offset_begin=token.character_offset_begin,
+                character_offset_end=token.character_offset_end,
+            )
+
+        for edge in dependency_parse.edges:
+            if edge.source_index not in tokens_by_index or edge.target_index not in tokens_by_index:
+                continue
+            weight = relation_weight(edge.relation)
+            _add_or_merge_weighted_edge(
+                graph,
+                source=edge.source_index,
+                target=edge.target_index,
+                relation=edge.relation,
+                weight=weight,
+                directed_source=edge.source_index,
+                directed_target=edge.target_index,
+            )
+        return graph
+
+    def _build_anchor_closure(
+        self,
+        weighted_graph: nx.Graph,
+        nodes: list[ExtractedNode],
+        anchor_positions: dict[str, list[int]],
+    ) -> nx.Graph:
         closure = nx.Graph()
-        for node in extraction.nodes:
+        for node in nodes:
+            positions = anchor_positions.get(node.placeholder, [])
             closure.add_node(
                 node.placeholder,
                 kind=node.kind,
                 text=node.text,
                 semantic_type=node.semantic_type,
-                order=min(anchor_positions.get(node.placeholder, [10**9])),
+                order=min(positions or [10**9]),
+                token_indices=positions,
             )
 
-        for left, right in itertools.combinations(anchors, 2):
-            path = self._shortest_anchor_path(folded_graph, left, right)
+        for left, right in itertools.combinations(nodes, 2):
+            path = self._shortest_anchor_token_path(
+                weighted_graph,
+                anchor_positions[left.placeholder],
+                anchor_positions[right.placeholder],
+            )
             if path is None:
                 continue
+            weight = _path_weight(weighted_graph, path)
             closure.add_edge(
-                left,
-                right,
-                weight=max(len(path) - 1, 1),
+                left.placeholder,
+                right.placeholder,
+                weight=weight,
                 token_path=path,
-                path_words=_path_words(folded_graph, path),
-                relations=_relations_for_path(folded_graph, path),
+                path_words=_path_words(weighted_graph, path),
+                relations=_relations_for_path(weighted_graph, path),
             )
+        return closure
 
-        if closure.number_of_nodes() > 1 and not nx.is_connected(closure):
-            components = [sorted(component) for component in nx.connected_components(closure)]
-            raise AnchorGraphError(
-                "Could not connect all anchors in the folded dependency graph. Components: "
-                + "; ".join(", ".join(component) for component in components)
-            )
+    @staticmethod
+    def _build_anchor_subgraph(weighted_graph: nx.Graph, closure: nx.Graph) -> nx.Graph:
+        subgraph = nx.Graph()
+        for _, _, attrs in closure.edges(data=True):
+            path = list(attrs.get("token_path", []))
+            for token_index in path:
+                if token_index in weighted_graph:
+                    subgraph.add_node(token_index, **weighted_graph.nodes[token_index])
+            for source, target in zip(path, path[1:]):
+                if weighted_graph.has_edge(source, target):
+                    subgraph.add_edge(source, target, **weighted_graph.edges[source, target])
+        return subgraph
 
+    @staticmethod
+    def _build_semantic_mst(closure: nx.Graph) -> tuple[nx.Graph, list[AnchorEdge]]:
         mst = nx.minimum_spanning_tree(closure, weight="weight")
-        anchor_graph = nx.Graph()
+        semantic_graph = nx.Graph()
         for node, attrs in closure.nodes(data=True):
-            anchor_graph.add_node(node, **attrs)
+            semantic_graph.add_node(node, **attrs)
 
         anchor_edges: list[AnchorEdge] = []
         for source, target, attrs in mst.edges(data=True):
@@ -74,7 +166,7 @@ class GraphBuilder:
                 relations=list(attrs.get("relations", [])),
             )
             anchor_edges.append(edge)
-            anchor_graph.add_edge(
+            semantic_graph.add_edge(
                 source,
                 target,
                 weight=edge.weight,
@@ -82,73 +174,29 @@ class GraphBuilder:
                 path_words=edge.path_words,
                 relations=edge.relations,
             )
+        return semantic_graph, anchor_edges
 
-        return AnchorGraph(
-            graph=anchor_graph,
-            edges=anchor_edges,
-            anchor_positions=anchor_positions,
-            folded_graph=folded_graph,
-        )
-
-    def _fold_dependency_graph(
-        self,
-        dependency_parse: DependencyParse,
-        extraction: ExtractionResult,
-    ) -> tuple[nx.Graph, dict[str, list[int]]]:
-        tokens_by_index = {token.index: token for token in dependency_parse.tokens}
-        anchor_positions = self._align_anchor_spans(dependency_parse.tokens, extraction.nodes)
-        token_to_anchor = _token_to_anchor(anchor_positions)
-        internal_tokens = set(token_to_anchor)
-
-        graph = nx.Graph()
-        for token in dependency_parse.tokens:
-            if token.index in internal_tokens:
-                continue
-            graph.add_node(
-                token.index,
-                kind="token",
-                word=token.word,
-                text=token.word,
-                order=token.index,
-                character_offset_begin=token.character_offset_begin,
-                character_offset_end=token.character_offset_end,
-            )
-
-        for node in extraction.nodes:
-            folded_token_indices = sorted(anchor_positions.get(node.placeholder, []))
-            if not folded_token_indices:
-                continue
-            graph.add_node(
-                node.placeholder,
-                kind=node.kind,
-                word=node.placeholder,
-                text=node.text,
-                semantic_type=node.semantic_type,
-                order=min(folded_token_indices),
-                start=node.start,
-                end=node.end,
-                occurrence=node.occurrence,
-                folded_token_indices=folded_token_indices,
-                folded_words=[tokens_by_index[index].word for index in folded_token_indices if index in tokens_by_index],
-            )
-
-        for edge in dependency_parse.edges:
-            source = token_to_anchor.get(edge.source_index, edge.source_index)
-            target = token_to_anchor.get(edge.target_index, edge.target_index)
-            if source == target:
-                continue
-            _ensure_token_endpoint(graph, source, tokens_by_index)
-            _ensure_token_endpoint(graph, target, tokens_by_index)
-            _add_or_merge_edge(
-                graph,
-                source=source,
-                target=target,
-                relation=edge.relation,
-                directed_source=edge.source_index,
-                directed_target=edge.target_index,
-            )
-
-        return graph, anchor_positions
+    @staticmethod
+    def _shortest_anchor_token_path(
+        graph: nx.Graph,
+        left_positions: list[int],
+        right_positions: list[int],
+    ) -> list[int] | None:
+        best_path: list[int] | None = None
+        best_weight = float("inf")
+        for left in left_positions:
+            for right in right_positions:
+                try:
+                    path = nx.shortest_path(graph, left, right, weight="weight")
+                except nx.NetworkXNoPath:
+                    continue
+                weight = _path_weight(graph, path)
+                if weight < best_weight or (
+                    weight == best_weight and best_path is not None and len(path) < len(best_path)
+                ):
+                    best_path = path
+                    best_weight = weight
+        return best_path
 
     def _align_anchor_spans(
         self,
@@ -213,14 +261,6 @@ class GraphBuilder:
             raise AnchorGraphError(_format_missing_alignment_error(missing, raw_alignments))
         return resolved
 
-    @staticmethod
-    def _shortest_anchor_path(graph: nx.Graph, left: str, right: str) -> list[Any] | None:
-        try:
-            return nx.shortest_path(graph, left, right, weight="weight")
-        except nx.NetworkXNoPath:
-            return None
-
-
 class _TokenClaim:
     def __init__(
         self,
@@ -251,6 +291,38 @@ class _TokenClaim:
 
 def format_dependency_edges(dependency_parse: DependencyParse) -> list[str]:
     return [f"  - {edge.display()}" for edge in dependency_parse.edges]
+
+
+def format_weighted_graph_edges(graph: nx.Graph) -> list[str]:
+    lines: list[str] = []
+    for source, target, attrs in sorted(
+        graph.edges(data=True),
+        key=lambda item: (
+            _node_order(graph, item[0]),
+            _node_order(graph, item[1]),
+            str(item[0]),
+            str(item[1]),
+        ),
+    ):
+        relation = "|".join(attrs.get("relations", [])) or attrs.get("relation", "")
+        relation_text = f" ({relation})" if relation else ""
+        lines.append(
+            f"  - {_graph_node_label(graph, source)} --{attrs.get('weight', DEFAULT_RELATION_WEIGHT)}-- "
+            f"{_graph_node_label(graph, target)}{relation_text}"
+        )
+    return lines
+
+
+def relation_weight(relation: str) -> int:
+    normalized = relation.strip()
+    base = normalized.split(":", 1)[0]
+    if normalized in LOW_WEIGHT_RELATIONS:
+        return 1
+    if normalized in MEDIUM_WEIGHT_RELATIONS or base in MEDIUM_WEIGHT_BASES:
+        return 3
+    if base in HIGH_WEIGHT_BASES:
+        return 5
+    return DEFAULT_RELATION_WEIGHT
 
 
 def format_graph_lines(
@@ -384,46 +456,19 @@ def _semantic_specificity(node: ExtractedNode) -> int:
     return score
 
 
-def _token_to_anchor(anchor_positions: dict[str, list[int]]) -> dict[int, str]:
-    result: dict[int, str] = {}
-    for placeholder, token_indices in anchor_positions.items():
-        for token_index in token_indices:
-            result[token_index] = placeholder
-    return result
-
-
-def _ensure_token_endpoint(
+def _add_or_merge_weighted_edge(
     graph: nx.Graph,
-    node_id: int | str,
-    tokens_by_index: dict[int, CoreNLPToken],
-) -> None:
-    if node_id in graph or not isinstance(node_id, int):
-        return
-    token = tokens_by_index.get(node_id)
-    if token is None:
-        return
-    graph.add_node(
-        node_id,
-        kind="token",
-        word=token.word,
-        text=token.word,
-        order=token.index,
-        character_offset_begin=token.character_offset_begin,
-        character_offset_end=token.character_offset_end,
-    )
-
-
-def _add_or_merge_edge(
-    graph: nx.Graph,
-    source: int | str,
-    target: int | str,
+    source: int,
+    target: int,
     relation: str,
+    weight: int,
     directed_source: int,
     directed_target: int,
 ) -> None:
     if graph.has_edge(source, target):
         relations = list(graph.edges[source, target].get("relations", []))
         directed_edges = list(graph.edges[source, target].get("directed_edges", []))
+        weight = min(int(graph.edges[source, target].get("weight", weight)), weight)
     else:
         relations = []
         directed_edges = []
@@ -440,7 +485,7 @@ def _add_or_merge_edge(
     graph.add_edge(
         source,
         target,
-        weight=1,
+        weight=weight,
         relation="|".join(relations),
         relations=relations,
         directed_edges=directed_edges,
@@ -449,6 +494,13 @@ def _add_or_merge_edge(
 
 def _path_words(graph: nx.Graph, path: list[Any]) -> list[str]:
     return [str(graph.nodes[node].get("word", node)) for node in path]
+
+
+def _path_weight(graph: nx.Graph, path: list[Any]) -> int:
+    total = 0
+    for left, right in zip(path, path[1:]):
+        total += int(graph.edges[left, right].get("weight", DEFAULT_RELATION_WEIGHT))
+    return total
 
 
 def _relations_for_path(graph: nx.Graph, path: list[Any]) -> list[str]:
@@ -475,6 +527,21 @@ def _format_missing_alignment_error(
             f"{node.placeholder} text={node.text!r} span=({node.start}, {node.end}) occurrence={node.occurrence}{raw}"
         )
     return "Could not align extracted spans to CoreNLP tokens for anchors: " + "; ".join(details)
+
+
+def _token_label(token: CoreNLPToken) -> str:
+    return f"{token.word}[{token.index}]"
+
+
+def _graph_node_label(graph: nx.Graph, node: Any) -> str:
+    attrs = graph.nodes[node]
+    label = attrs.get("label")
+    if label:
+        return str(label)
+    word = attrs.get("word")
+    if word:
+        return f"{word}[{node}]" if isinstance(node, int) else str(word)
+    return str(node)
 
 
 def _node_order(graph: nx.Graph, node: str) -> int:
@@ -532,4 +599,3 @@ def _choose_multi_entity_target(graph: nx.Graph, entity_nodes: list[str]) -> str
         return (max_distance, total, -_node_order(graph, node))
 
     return min(candidates, key=score)
-

@@ -33,9 +33,9 @@ class SubquestionGenerator:
         ast: ASTResult,
         extraction: ExtractionResult,
     ) -> list[AtomicSubquestion]:
-        compare_operator = self._first_compare_operator(ast)
-        if compare_operator:
-            return self._generate_compare(original_question, ast, extraction, compare_operator)
+        operator_node = self._first_operator(ast)
+        if operator_node:
+            return self._generate_operator(original_question, ast, extraction, operator_node)
         return self._generate_general(original_question, ast, extraction)
 
     def _generate_general(
@@ -91,6 +91,7 @@ class SubquestionGenerator:
             if edge_key in visited_edges:
                 continue
             visited_edges.add(edge_key)
+            edge_hint = _edge_hint(graph, current, neighbor)
             answer_var = state.next_serial_var()
             question_text = self._one_hop_question(
                 original_question=original_question,
@@ -99,7 +100,7 @@ class SubquestionGenerator:
                 source_original=current_original,
                 target_original=ast.display_label(neighbor),
                 answer_variable=answer_var,
-                edge_hint=None,
+                edge_hint=edge_hint,
             )
             questions.append(
                 AtomicSubquestion(
@@ -123,7 +124,7 @@ class SubquestionGenerator:
                 visited_edges=visited_edges,
             )
 
-    def _generate_compare(
+    def _generate_operator(
         self,
         original_question: str,
         ast: ASTResult,
@@ -158,6 +159,7 @@ class SubquestionGenerator:
                 if edge_identity in used_edges:
                     continue
                 used_edges.add(edge_identity)
+                edge_hint = _edge_hint(graph, source, target_node)
                 if step_index == 1:
                     answer_var = f"X{branch_index}"
                 elif target_node == target:
@@ -171,7 +173,7 @@ class SubquestionGenerator:
                     source_original=current_original,
                     target_original=ast.display_label(target_node),
                     answer_variable=answer_var,
-                    edge_hint=None,
+                    edge_hint=edge_hint,
                 )
                 questions.append(
                     AtomicSubquestion(
@@ -188,8 +190,9 @@ class SubquestionGenerator:
             if branch_final:
                 final_vars.append(branch_final)
 
-        if len(final_vars) >= 2:
-            operator_name = str(ast.graph.nodes[operator_node].get("text", operator_node))
+        operator_name = str(ast.graph.nodes[operator_node].get("text", operator_node))
+        min_vars = 2 if operator_name.startswith("COMPARE") or operator_name in {"INTERSECTION", "UNION", "DIFFERENCE"} else 1
+        if len(final_vars) >= min_vars:
             compare_question = _operator_question(operator_name, final_vars)
             questions.append(
                 AtomicSubquestion(
@@ -238,9 +241,9 @@ class SubquestionGenerator:
         return result
 
     @staticmethod
-    def _first_compare_operator(ast: ASTResult) -> str | None:
+    def _first_operator(ast: ASTResult) -> str | None:
         for node, attrs in ast.graph.nodes(data=True):
-            if attrs.get("kind") == "operator" and str(attrs.get("text", "")).startswith("COMPARE"):
+            if attrs.get("kind") == "operator":
                 return node
         return None
 
@@ -274,14 +277,26 @@ def _slug(value: str) -> str:
 
 
 def _operator_question(operator: str, variables: list[str]) -> str:
-    if operator == "COMPARE_DIFFERENT":
+    if operator == "COMPARE_DIFF":
         return f"Are {' and '.join(variables)} different?"
     if operator == "COMPARE_SAME":
         return f"Are {' and '.join(variables)} the same?"
-    if operator == "COUNT":
-        return f"How many values are in {', '.join(variables)}?"
-    if operator == "OR":
+    if operator == "INTERSECTION":
+        return f"What values are common to {' and '.join(variables)}?"
+    if operator == "UNION":
+        return f"What values are in either {' or '.join(variables)}?"
+    if operator == "DIFFERENCE":
+        return f"What values are in {variables[0]} but not in {variables[1]}?" if len(variables) >= 2 else f"What is the difference for {', '.join(variables)}?"
+    if operator == "COMPARE_GREATER":
+        return f"Which is greater, {' or '.join(variables)}?"
+    if operator == "COMPARE_LESS":
+        return f"Which is less, {' or '.join(variables)}?"
+    if operator == "ARGMAX":
+        return f"Which has the maximum value among {', '.join(variables)}?"
+    if operator == "ARGMIN":
+        return f"Which has the minimum value among {', '.join(variables)}?"
+    if operator == "LOGICAL_OR":
         return f"Does either {' or '.join(variables)} satisfy the condition?"
-    if operator == "AND":
+    if operator == "LOGICAL_AND":
         return f"Do {' and '.join(variables)} all satisfy the condition?"
     return f"Apply {operator} to {', '.join(variables)}."

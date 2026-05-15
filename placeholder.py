@@ -182,6 +182,8 @@ def selective_entity_masking(
     )
 
     mapping = {node.placeholder: node.text for node in anchor_extraction.nodes}
+    for placeholder, info in mask_mapping.items():
+        mapping[placeholder] = str(info.get("text", mapping.get(placeholder, placeholder)))
     replacements = [
         {
             "start": candidate.start,

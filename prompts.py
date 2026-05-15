@@ -4,18 +4,22 @@ import json
 
 ALLOWED_OPERATORS = [
     "COMPARE_SAME",
-    "COMPARE_DIFFERENT",
-    "AND",
-    "OR",
-    "FILTER",
-    "COUNT",
-    "BRIDGE",
+    "COMPARE_DIFF",
+    "INTERSECTION",
+    "UNION",
+    "DIFFERENCE",
+    "COMPARE_GREATER",
+    "COMPARE_LESS",
+    "ARGMAX",
+    "ARGMIN",
+    "LOGICAL_AND",
+    "LOGICAL_OR",
     "NONE",
 ]
 
 GLOBAL_METHOD_GUARD = """
 You are implementing the DEPO method from depo.md.
-CoreNLP parses a selectively masked question: only complex long entities may be replaced by EntityA/EntityB.
+CoreNLP parses a selectively masked question: complex noun phrases may be replaced by POS-hinting placeholders such as MovieA, CompanyA, or NetworkA.
 Type variables and syntactic scaffold words stay in natural language.
 After parsing, entity/type-variable token spans are folded into anchor supernodes on the dependency graph.
 The MST is an anchor-only MST over entity/type-variable anchor nodes.
@@ -108,8 +112,8 @@ OPERATOR_SELECTION_SYSTEM = (
     GLOBAL_METHOD_GUARD
     + f"""
 Current step: choose operators and shared-node attachments for the final AST.
-The input graph is already an anchor-only MST produced after dependency-graph subtree folding.
-You must not rewrite the anchor MST.
+The input graph is already an anchor-only semantic graph built from weighted dependency shortest paths.
+You must not rewrite the anchor graph.
 You must not add, remove, or reorder anchor-anchor edges.
 You must not generate subquestions.
 You may only choose from this fixed operator set: {", ".join(ALLOWED_OPERATORS)}.
@@ -133,7 +137,7 @@ def build_operator_prompt(
         ]
     }
     return f"""
-Given the original question and the anchor MST, choose only the needed operator(s) and the existing anchor node(s) they attach to.
+Given the original question and the anchor-only semantic graph, choose only the needed operator(s) and the existing anchor node(s) they attach to.
 
 Original question:
 {question}
@@ -141,15 +145,18 @@ Original question:
 Anchor nodes:
 {json.dumps(anchor_nodes, ensure_ascii=False, indent=2)}
 
-Anchor MST edges:
+Anchor semantic graph edges:
 {json.dumps(anchor_edges, ensure_ascii=False, indent=2)}
 
 Rules:
-- Keep the anchor MST unchanged.
-- If the graph is a simple serial bridge, use BRIDGE or NONE.
+- Keep the anchor graph unchanged.
+- If the graph is a simple serial bridge with no comparison, set, extremum, or logical operator, use NONE.
 - If the question asks whether two branch results are the same, use COMPARE_SAME and attach it to the shared result node.
-- If the question asks whether two branch results are different, use COMPARE_DIFFERENT and attach it to the shared result node.
-- For count questions, use COUNT and attach it to the counted result node.
+- If the question asks whether two branch results are different, use COMPARE_DIFF and attach it to the shared result node.
+- Use INTERSECTION for common/shared results, UNION for either/all alternatives, and DIFFERENCE for results present in one branch but not another.
+- Use COMPARE_GREATER or COMPARE_LESS for numeric/ordered comparisons.
+- Use ARGMAX or ARGMIN for superlative maximum/minimum selection.
+- Use LOGICAL_AND or LOGICAL_OR for explicit boolean combination conditions.
 - Do not create new anchor nodes.
 - Do not generate subquestions.
 

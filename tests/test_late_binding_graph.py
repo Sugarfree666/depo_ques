@@ -7,7 +7,7 @@ import networkx as nx
 
 from entity_extractor import _repair_duplicate_surface_spans
 from ast_builder import ASTBuilder
-from graph_builder import GraphBuilder
+from graph_builder import GraphBuilder, relation_weight
 from models import CoreNLPToken, DependencyEdge, DependencyParse, ExtractionResult, ExtractedNode
 from placeholder import replace_with_placeholders, selective_entity_masking
 from subquestion_generator import SubquestionGenerator
@@ -68,6 +68,16 @@ class LateBindingGraphTests(unittest.TestCase):
         edge = DependencyEdge("share", "nsubj", "director", 4, 2)
 
         self.assertEqual(edge.display(), "share[4] --nsubj--> director[2]")
+
+    def test_dependency_relation_weight_table(self) -> None:
+        self.assertEqual(relation_weight("nsubj"), 1)
+        self.assertEqual(relation_weight("obj"), 1)
+        self.assertEqual(relation_weight("nmod:of"), 3)
+        self.assertEqual(relation_weight("obl:in"), 3)
+        self.assertEqual(relation_weight("compound"), 3)
+        self.assertEqual(relation_weight("conj:and"), 5)
+        self.assertEqual(relation_weight("det"), 5)
+        self.assertEqual(relation_weight("unknown_relation"), 3)
 
     def test_selective_masking_masks_complex_films_and_preserves_type_variables(self) -> None:
         question = (
@@ -250,8 +260,9 @@ class LateBindingGraphTests(unittest.TestCase):
         anchor_graph = GraphBuilder().build_anchor_graph(DependencyParse(tokens, edges), extraction)
 
         self.assertEqual(set(anchor_graph.graph.nodes), {"FilmAlpha", "FilmBeta", "PersonAlpha", "PersonBeta", "NationalityAlpha"})
-        self.assertNotIn(token_index(tokens, "Ten9Eight"), anchor_graph.folded_graph.nodes)
-        self.assertNotIn(token_index(tokens, "Sabotage"), anchor_graph.folded_graph.nodes)
+        self.assertTrue(all(isinstance(node, str) for node in anchor_graph.graph.nodes))
+        self.assertIn(token_index(tokens, "Ten9Eight"), anchor_graph.anchor_subgraph.nodes)
+        self.assertIn(token_index(tokens, "Sabotage"), anchor_graph.anchor_subgraph.nodes)
         self.assertEqual(anchor_graph.anchor_positions["PersonAlpha"], [token_index(tokens, "director", 1)])
         self.assertEqual(anchor_graph.anchor_positions["PersonBeta"], [token_index(tokens, "director", 2)])
 
@@ -315,7 +326,7 @@ class LateBindingGraphTests(unittest.TestCase):
 
         self.assertEqual(
             [ast.display_label(node) for node in path],
-            ["AlphaGo", "the artificial intelligence company", "CEO", "university", "city"],
+            ["AlphaGo", "artificial intelligence company", "CEO", "university", "city"],
         )
 
         one_hop_llm = FakeLLM()
