@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import math
 import re
 import unittest
 
 import networkx as nx
 
-from entity_extractor import _repair_duplicate_surface_spans
+from entity_extractor import EntityExtractor, _repair_duplicate_surface_spans
 from ast_builder import ASTBuilder
 from graph_builder import GraphBuilder, relation_weight
-from models import CoreNLPToken, DependencyEdge, DependencyParse, ExtractionResult, ExtractedNode
+from models import AnchorGraph, CoreNLPToken, DependencyEdge, DependencyParse, ExtractionResult, ExtractedNode
 from placeholder import replace_with_placeholders, selective_entity_masking
-from subquestion_generator import SubquestionGenerator
+from subquestion_generator import SubquestionGenerator, _enforce_source_variable_binding
 
 
 class FakeLLM:
@@ -36,6 +37,14 @@ class FakeLLM:
         self.one_hop_calls += 1
         self.one_hop_prompts.append(user_prompt)
         return {"question": f"mock one-hop question {self.one_hop_calls}?"}
+
+
+class FakeExtractorLLM:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+
+    def chat_json(self, system_prompt: str, user_prompt: str, max_retries: int = 3) -> dict[str, object]:
+        return self.payload
 
 
 def make_tokens(question: str) -> list[CoreNLPToken]:
@@ -75,9 +84,204 @@ class LateBindingGraphTests(unittest.TestCase):
         self.assertEqual(relation_weight("nmod:of"), 3)
         self.assertEqual(relation_weight("obl:in"), 3)
         self.assertEqual(relation_weight("compound"), 3)
-        self.assertEqual(relation_weight("conj:and"), 5)
+        self.assertTrue(math.isinf(relation_weight("conj:and")))
         self.assertEqual(relation_weight("det"), 5)
         self.assertEqual(relation_weight("unknown_relation"), 3)
+
+    def test_one_hop_question_enforces_previous_answer_variable(self) -> None:
+        self.assertEqual(
+            _enforce_source_variable_binding(
+                "Which CEO is associated with the artificial intelligence company?",
+                "X1",
+                "artificial intelligence company",
+            ),
+            "Which CEO is associated with X1?",
+        )
+        self.assertEqual(
+            _enforce_source_variable_binding(
+                "Which university did the CEO graduate from?",
+                "X2",
+                "CEO",
+            ),
+            "Which university did X2 graduate from?",
+        )
+
+    def test_extractor_infers_implicit_age_anchor_from_comparative_cue(self) -> None:
+        question = "Who is older, Ryan Tubridy or Mauro Massironi?"
+        payload = {
+            "entities": [
+                {"text": "Ryan Tubridy", "semantic_type": "Person", "placeholder": "PersonAlpha"},
+                {"text": "Mauro Massironi", "semantic_type": "Person", "placeholder": "PersonBeta"},
+            ],
+            "type_variables": [],
+        }
+
+        extraction = EntityExtractor(FakeExtractorLLM(payload)).extract(question)
+
+        age_nodes = [node for node in extraction.type_variables if node.semantic_type == "Age"]
+        self.assertEqual(len(age_nodes), 1)
+        self.assertEqual(age_nodes[0].text, "age")
+        self.assertEqual(question[age_nodes[0].start : age_nodes[0].end], "older")
+        self.assertEqual(age_nodes[0].occurrence, 0)
+
+    def test_extractor_maps_existing_implicit_type_variable_to_cue_span(self) -> None:
+        question = "Who is older, Ryan Tubridy or Mauro Massironi?"
+        payload = {
+            "entities": [
+                {"text": "Ryan Tubridy", "semantic_type": "Person", "placeholder": "PersonAlpha"},
+                {"text": "Mauro Massironi", "semantic_type": "Person", "placeholder": "PersonBeta"},
+            ],
+            "type_variables": [
+                {"text": "age", "semantic_type": "Age", "placeholder": "AgeAlpha"},
+            ],
+        }
+
+        extraction = EntityExtractor(FakeExtractorLLM(payload)).extract(question)
+
+        self.assertEqual(len(extraction.type_variables), 1)
+        age = extraction.type_variables[0]
+        self.assertEqual(age.placeholder, "AgeAlpha")
+        self.assertEqual(question[age.start : age.end], "older")
+        self.assertEqual(age.occurrence, 0)
+
+    def test_extractor_normalizes_comparative_surface_variable_to_attribute(self) -> None:
+        question = "Who is older, Ryan Tubridy or Mauro Massironi?"
+        payload = {
+            "entities": [
+                {"text": "Ryan Tubridy", "semantic_type": "Person", "placeholder": "PersonAlpha"},
+                {"text": "Mauro Massironi", "semantic_type": "Person", "placeholder": "PersonBeta"},
+            ],
+            "type_variables": [
+                {"text": "older", "semantic_type": "Age", "placeholder": "AgeAlpha"},
+            ],
+        }
+
+        extraction = EntityExtractor(FakeExtractorLLM(payload)).extract(question)
+
+        self.assertEqual(len(extraction.type_variables), 1)
+        age = extraction.type_variables[0]
+        self.assertEqual(age.text, "age")
+        self.assertEqual(age.semantic_type, "Age")
+        self.assertEqual(question[age.start : age.end], "older")
+        self.assertEqual(age.occurrence, 0)
+
+    def test_implicit_age_anchor_aligns_to_comparative_token_in_anchor_graph(self) -> None:
+        question = "Who is older, Ryan Tubridy or Mauro Massironi?"
+        tokens = make_tokens(question)
+        extraction = ExtractionResult(
+            entities=[
+                ExtractedNode("PersonAlpha", "Ryan Tubridy", "entity", "Person", *span(question, "Ryan Tubridy")),
+                ExtractedNode("PersonBeta", "Mauro Massironi", "entity", "Person", *span(question, "Mauro Massironi")),
+            ],
+            type_variables=[
+                ExtractedNode("AgeAlpha", "age", "type_variable", "Age", *span(question, "older"), occurrence=0),
+            ],
+        )
+        edges = [
+            DependencyEdge("Who", "nsubj", "older", token_index(tokens, "Who"), token_index(tokens, "older")),
+            DependencyEdge("older", "punct", ",", token_index(tokens, "older"), token_index(tokens, ",")),
+            DependencyEdge(",", "dep", "Tubridy", token_index(tokens, ","), token_index(tokens, "Tubridy")),
+            DependencyEdge(",", "dep", "Massironi", token_index(tokens, ","), token_index(tokens, "Massironi")),
+            DependencyEdge("Tubridy", "compound", "Ryan", token_index(tokens, "Tubridy"), token_index(tokens, "Ryan")),
+            DependencyEdge("Massironi", "compound", "Mauro", token_index(tokens, "Massironi"), token_index(tokens, "Mauro")),
+            DependencyEdge("Tubridy", "conj:or", "Massironi", token_index(tokens, "Tubridy"), token_index(tokens, "Massironi")),
+        ]
+
+        anchor_graph = GraphBuilder().build_anchor_graph(DependencyParse(tokens, edges), extraction)
+
+        self.assertEqual(anchor_graph.anchor_positions["AgeAlpha"], [token_index(tokens, "older")])
+        self.assertEqual(set(anchor_graph.graph.nodes), {"PersonAlpha", "PersonBeta", "AgeAlpha"})
+        self.assertTrue(nx.has_path(anchor_graph.graph, "PersonAlpha", "AgeAlpha"))
+        self.assertTrue(nx.has_path(anchor_graph.graph, "PersonBeta", "AgeAlpha"))
+        semantic_edges = {frozenset(edge) for edge in anchor_graph.graph.edges}
+        self.assertEqual(
+            semantic_edges,
+            {frozenset(("PersonAlpha", "AgeAlpha")), frozenset(("PersonBeta", "AgeAlpha"))},
+        )
+
+    def test_selective_masking_preserves_implicit_attribute_cue_span(self) -> None:
+        question = "Who is older, Ryan Tubridy or Mauro Massironi?"
+        extraction = ExtractionResult(
+            entities=[
+                ExtractedNode("PersonAlpha", "Ryan Tubridy", "entity", "Person", *span(question, "Ryan Tubridy")),
+                ExtractedNode("PersonBeta", "Mauro Massironi", "entity", "Person", *span(question, "Mauro Massironi")),
+            ],
+            type_variables=[
+                ExtractedNode("AgeAlpha", "age", "type_variable", "Age", *span(question, "older"), occurrence=0),
+            ],
+        )
+
+        replacement = selective_entity_masking(question, extraction)
+        age = replacement.anchor_extraction.type_variables[0] if replacement.anchor_extraction else None
+
+        self.assertEqual(replacement.masked_question, question)
+        self.assertIsNotNone(age)
+        assert age is not None
+        self.assertEqual(question[age.start : age.end], "older")
+        self.assertEqual(replacement.preserved_type_variables[0]["text"], "age")
+
+    def test_compare_operator_prefers_implicit_attribute_anchor_over_entities(self) -> None:
+        question = "Who is older, Ryan Tubridy or Mauro Massironi?"
+        extraction = ExtractionResult(
+            entities=[
+                ExtractedNode("PersonAlpha", "Ryan Tubridy", "entity", "Person", *span(question, "Ryan Tubridy")),
+                ExtractedNode("PersonBeta", "Mauro Massironi", "entity", "Person", *span(question, "Mauro Massironi")),
+            ],
+            type_variables=[
+                ExtractedNode("AgeAlpha", "age", "type_variable", "Age", *span(question, "older"), occurrence=0),
+            ],
+        )
+        graph = nx.Graph()
+        graph.add_node("PersonAlpha", kind="entity", text="Ryan Tubridy", semantic_type="Person", order=6)
+        graph.add_node("PersonBeta", kind="entity", text="Mauro Massironi", semantic_type="Person", order=9)
+        graph.add_node("AgeAlpha", kind="type_variable", text="age", semantic_type="Age", order=3)
+        graph.add_edge("PersonAlpha", "AgeAlpha", weight=10)
+        graph.add_edge("PersonBeta", "AgeAlpha", weight=10)
+        anchor_graph = AnchorGraph(graph=graph, edges=[], anchor_positions={})
+
+        ast = ASTBuilder(FakeLLM("COMPARE_GREATER", ["PersonAlpha", "PersonBeta"])).build(
+            question,
+            extraction,
+            replace_with_placeholders(question, extraction),
+            anchor_graph,
+        )
+
+        self.assertEqual(ast.operators[0].attach_to, ["AgeAlpha"])
+        self.assertTrue(ast.graph.has_edge("AgeAlpha", "COMPARE_GREATER"))
+
+    def test_compare_subquestions_use_direct_entity_to_implicit_attribute_hops(self) -> None:
+        question = "Who is older, Ryan Tubridy or Mauro Massironi?"
+        extraction = ExtractionResult(
+            entities=[
+                ExtractedNode("PersonAlpha", "Ryan Tubridy", "entity", "Person", *span(question, "Ryan Tubridy")),
+                ExtractedNode("PersonBeta", "Mauro Massironi", "entity", "Person", *span(question, "Mauro Massironi")),
+            ],
+            type_variables=[
+                ExtractedNode("AgeAlpha", "age", "type_variable", "Age", *span(question, "older"), occurrence=0),
+            ],
+        )
+        graph = nx.Graph()
+        graph.add_node("AgeAlpha", kind="type_variable", text="age", semantic_type="Age", order=3)
+        graph.add_node("PersonAlpha", kind="entity", text="Ryan Tubridy", semantic_type="Person", order=6)
+        graph.add_node("PersonBeta", kind="entity", text="Mauro Massironi", semantic_type="Person", order=9)
+        graph.add_edge("PersonAlpha", "PersonBeta", weight=5, relations=["conj:or"])
+        graph.add_edge("PersonAlpha", "AgeAlpha", weight=10, relations=["punct/dep"])
+        anchor_graph = AnchorGraph(graph=graph, edges=[], anchor_positions={})
+        ast = ASTBuilder(FakeLLM("COMPARE_GREATER", ["AgeAlpha"])).build(
+            question,
+            extraction,
+            replace_with_placeholders(question, extraction),
+            anchor_graph,
+        )
+
+        subquestions = SubquestionGenerator(FakeLLM()).generate(question, ast, extraction)
+
+        self.assertEqual(
+            [(item.source_node, item.target_node) for item in subquestions[:2]],
+            [("PersonAlpha", "AgeAlpha"), ("PersonBeta", "AgeAlpha")],
+        )
+        self.assertEqual([item.answer_variable for item in subquestions[:2]], ["X1", "X2"])
+        self.assertEqual(subquestions[-1].question, "Which is greater, X1 or X2?")
 
     def test_selective_masking_masks_complex_films_and_preserves_type_variables(self) -> None:
         question = (

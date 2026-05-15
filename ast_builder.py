@@ -92,6 +92,7 @@ class ASTBuilder:
             if not isinstance(attach_to, list):
                 attach_to = []
             valid_attach = [str(anchor) for anchor in attach_to if str(anchor) in graph]
+            valid_attach = _normalize_operator_attachment(operator, valid_attach, graph)
             explanation = str(item.get("explanation", ""))
             selections.append(
                 OperatorSelection(
@@ -139,3 +140,19 @@ def _canonical_operator(operator: str) -> str:
         "FILTER": "NONE",
     }
     return aliases.get(operator, operator)
+
+
+def _normalize_operator_attachment(operator: str, attach_to: list[str], graph: nx.Graph) -> list[str]:
+    if not operator.startswith("COMPARE") or not attach_to:
+        return attach_to
+    if any(graph.nodes[node].get("kind") == "type_variable" for node in attach_to):
+        return attach_to
+
+    attribute_nodes = [
+        node
+        for node, attrs in graph.nodes(data=True)
+        if attrs.get("kind") == "type_variable"
+    ]
+    if not attribute_nodes:
+        return attach_to
+    return [max(attribute_nodes, key=lambda node: graph.nodes[node].get("order", 0))]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 import re
 from typing import Any, Callable
 
@@ -24,8 +25,10 @@ MEDIUM_WEIGHT_BASES = {
     "cop",
 }
 MEDIUM_WEIGHT_RELATIONS = {"nmod:of", "acl:relcl", "aux:pass"}
-HIGH_WEIGHT_BASES = {"conj", "cc", "det", "punct", "dep"}
+HIGH_WEIGHT_BASES = {"cc", "det", "punct", "dep"}
+COORDINATION_WEIGHT_BASES = {"conj"}
 DEFAULT_RELATION_WEIGHT = 3
+INFINITE_RELATION_WEIGHT = math.inf
 
 
 class AnchorGraphError(RuntimeError):
@@ -150,7 +153,14 @@ class GraphBuilder:
 
     @staticmethod
     def _build_semantic_mst(closure: nx.Graph) -> tuple[nx.Graph, list[AnchorEdge]]:
-        mst = nx.minimum_spanning_tree(closure, weight="weight")
+        ranked_closure = closure.copy()
+        for source, target, attrs in ranked_closure.edges(data=True):
+            attrs["mst_weight"] = _edge_weight(attrs) * 1000 + _mst_tie_penalty(
+                ranked_closure,
+                source,
+                target,
+            )
+        mst = nx.minimum_spanning_tree(ranked_closure, weight="mst_weight")
         semantic_graph = nx.Graph()
         for node, attrs in closure.nodes(data=True):
             semantic_graph.add_node(node, **attrs)
@@ -160,7 +170,7 @@ class GraphBuilder:
             edge = AnchorEdge(
                 source=source,
                 target=target,
-                weight=int(attrs.get("weight", 1)),
+                weight=_edge_weight(attrs, default=1),
                 token_path=list(attrs.get("token_path", [])),
                 path_words=list(attrs.get("path_words", [])),
                 relations=list(attrs.get("relations", [])),
@@ -183,19 +193,15 @@ class GraphBuilder:
         right_positions: list[int],
     ) -> list[int] | None:
         best_path: list[int] | None = None
-        best_weight = float("inf")
         for left in left_positions:
             for right in right_positions:
                 try:
-                    path = nx.shortest_path(graph, left, right, weight="weight")
+                    path = nx.shortest_path(graph, left, right, weight=_dijkstra_weight)
                 except nx.NetworkXNoPath:
                     continue
-                weight = _path_weight(graph, path)
-                if weight < best_weight or (
-                    weight == best_weight and best_path is not None and len(path) < len(best_path)
-                ):
+                path_key = _path_sort_key(graph, path)
+                if best_path is None or path_key < _path_sort_key(graph, best_path):
                     best_path = path
-                    best_weight = weight
         return best_path
 
     def _align_anchor_spans(
@@ -313,13 +319,15 @@ def format_weighted_graph_edges(graph: nx.Graph) -> list[str]:
     return lines
 
 
-def relation_weight(relation: str) -> int:
+def relation_weight(relation: str) -> float:
     normalized = relation.strip()
     base = normalized.split(":", 1)[0]
     if normalized in LOW_WEIGHT_RELATIONS:
         return 1
     if normalized in MEDIUM_WEIGHT_RELATIONS or base in MEDIUM_WEIGHT_BASES:
         return 3
+    if base in COORDINATION_WEIGHT_BASES:
+        return INFINITE_RELATION_WEIGHT
     if base in HIGH_WEIGHT_BASES:
         return 5
     return DEFAULT_RELATION_WEIGHT
@@ -461,14 +469,14 @@ def _add_or_merge_weighted_edge(
     source: int,
     target: int,
     relation: str,
-    weight: int,
+    weight: float,
     directed_source: int,
     directed_target: int,
 ) -> None:
     if graph.has_edge(source, target):
         relations = list(graph.edges[source, target].get("relations", []))
         directed_edges = list(graph.edges[source, target].get("directed_edges", []))
-        weight = min(int(graph.edges[source, target].get("weight", weight)), weight)
+        weight = min(_edge_weight(graph.edges[source, target], default=weight), weight)
     else:
         relations = []
         directed_edges = []
@@ -496,11 +504,46 @@ def _path_words(graph: nx.Graph, path: list[Any]) -> list[str]:
     return [str(graph.nodes[node].get("word", node)) for node in path]
 
 
-def _path_weight(graph: nx.Graph, path: list[Any]) -> int:
-    total = 0
+def _path_weight(graph: nx.Graph, path: list[Any]) -> float:
+    total = 0.0
     for left, right in zip(path, path[1:]):
-        total += int(graph.edges[left, right].get("weight", DEFAULT_RELATION_WEIGHT))
+        total += _edge_weight(graph.edges[left, right])
     return total
+
+
+def _path_sort_key(graph: nx.Graph, path: list[Any]) -> tuple[float, int, int]:
+    coordination_penalty = 0
+    for left, right in zip(path, path[1:]):
+        coordination_penalty += _coordination_penalty(graph.edges[left, right])
+    return (_path_weight(graph, path), coordination_penalty, len(path))
+
+
+def _dijkstra_weight(source: Any, target: Any, attrs: dict[str, Any]) -> float:
+    del source, target
+    return _edge_weight(attrs) * 1000 + _coordination_penalty(attrs)
+
+
+def _edge_weight(attrs: dict[str, Any], default: float = DEFAULT_RELATION_WEIGHT) -> float:
+    value = attrs.get("weight", default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coordination_penalty(attrs: dict[str, Any]) -> int:
+    relations = attrs.get("relations") or []
+    for relation in relations:
+        if str(relation).split(":", 1)[0] in COORDINATION_WEIGHT_BASES:
+            return 1
+    return 0
+
+
+def _mst_tie_penalty(graph: nx.Graph, source: str, target: str) -> int:
+    kinds = {graph.nodes[source].get("kind"), graph.nodes[target].get("kind")}
+    penalty = 0 if "type_variable" in kinds else 1
+    penalty += _coordination_penalty(graph.edges[source, target])
+    return penalty
 
 
 def _relations_for_path(graph: nx.Graph, path: list[Any]) -> list[str]:

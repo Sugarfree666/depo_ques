@@ -142,15 +142,23 @@ class SubquestionGenerator:
             entities = [node for node in graph.nodes if graph.degree(node) <= 1 and node != target]
         entities = sorted(entities, key=lambda node: graph.nodes[node].get("order", 10**9))
 
+        operator_name = str(ast.graph.nodes[operator_node].get("text", operator_node))
+        use_direct_implicit_attribute = (
+            operator_name.startswith("COMPARE")
+            and _is_implicit_type_variable(target, extraction)
+        )
         questions: list[AtomicSubquestion] = []
         final_vars: list[str] = []
         used_edges: set[tuple[str, str, int]] = set()
 
         for branch_index, entity in enumerate(entities, start=1):
-            try:
-                path = nx.shortest_path(graph, entity, target)
-            except nx.NetworkXNoPath:
-                continue
+            if use_direct_implicit_attribute:
+                path = [entity, target]
+            else:
+                try:
+                    path = nx.shortest_path(graph, entity, target)
+                except nx.NetworkXNoPath:
+                    continue
             current_display = ast.display_label(entity)
             current_original = ast.display_label(entity)
             branch_final = None
@@ -190,7 +198,6 @@ class SubquestionGenerator:
             if branch_final:
                 final_vars.append(branch_final)
 
-        operator_name = str(ast.graph.nodes[operator_node].get("text", operator_node))
         min_vars = 2 if operator_name.startswith("COMPARE") or operator_name in {"INTERSECTION", "UNION", "DIFFERENCE"} else 1
         if len(final_vars) >= min_vars:
             compare_question = _operator_question(operator_name, final_vars)
@@ -229,7 +236,7 @@ class SubquestionGenerator:
         question = str(payload.get("question", "")).strip()
         if not question:
             raise RuntimeError("LLM returned an empty one-hop subquestion.")
-        return question
+        return _enforce_source_variable_binding(question, source_display, source_original)
 
     @staticmethod
     def _anchor_only_graph(graph: nx.Graph) -> nx.Graph:
@@ -274,6 +281,40 @@ def _slug(value: str) -> str:
     if not words:
         return "value"
     return "_".join(words[-2:]) if len(words) > 2 else "_".join(words)
+
+
+def _enforce_source_variable_binding(question: str, source_display: str, source_original: str) -> str:
+    if not _is_answer_variable(source_display) or _contains_variable(question, source_display):
+        return question
+
+    fixed = _replace_source_text(question, source_original, source_display)
+    if fixed != question:
+        return fixed
+    return f"For {source_display}, {question[:1].lower()}{question[1:]}" if question else question
+
+
+def _is_answer_variable(value: str) -> bool:
+    return bool(re.fullmatch(r"X\d+(?:_[A-Za-z0-9_]+)?", value.strip()))
+
+
+def _contains_variable(question: str, variable: str) -> bool:
+    return bool(re.search(rf"(?<![A-Za-z0-9_]){re.escape(variable)}(?![A-Za-z0-9_])", question))
+
+
+def _replace_source_text(question: str, source_original: str, variable: str) -> str:
+    source_words = re.findall(r"[A-Za-z0-9]+", source_original)
+    if not source_words:
+        return question
+    escaped = r"\s+".join(re.escape(word) for word in source_words)
+    pattern = re.compile(rf"\b(?:the|a|an)?\s*{escaped}\b", flags=re.IGNORECASE)
+    return pattern.sub(variable, question, count=1)
+
+
+def _is_implicit_type_variable(placeholder: str, extraction: ExtractionResult) -> bool:
+    for node in extraction.type_variables:
+        if node.placeholder == placeholder:
+            return node.occurrence == 0
+    return False
 
 
 def _operator_question(operator: str, variables: list[str]) -> str:

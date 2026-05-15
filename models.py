@@ -96,7 +96,7 @@ def _token_label(word: str, index: int) -> str:
 class AnchorEdge:
     source: str
     target: str
-    weight: int
+    weight: float
     token_path: list[Any]
     path_words: list[str]
     relations: list[str]

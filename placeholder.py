@@ -348,6 +348,9 @@ def _select_mask_candidates(question: str, extraction: ExtractionResult) -> list
 
 
 def _maskable_noun_phrase_span(question: str, node: ExtractedNode) -> tuple[int, int] | None:
+    if node.is_type_variable and node.occurrence == 0:
+        return None
+
     start, end = _resolve_node_span(question, node.text, node.start, node.end, node.occurrence)
     if start is None or end is None or not (0 <= start < end <= len(question)):
         return None
@@ -569,7 +572,9 @@ def _translate_or_find_span(
     node: ExtractedNode,
     replacements: list[tuple[int, int, str]],
 ) -> tuple[int | None, int | None]:
-    if _span_matches_text(original_question, node):
+    if _span_matches_text(original_question, node) or (
+        node.is_type_variable and node.occurrence == 0 and _valid_span_bounds(original_question, node.start, node.end)
+    ):
         translated = _translate_span(node.start or 0, node.end or 0, replacements)
         if translated != (None, None):
             return translated
