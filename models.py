@@ -354,6 +354,38 @@ class SemanticASTResult:
         return {node.id: node for node in self.nodes}
 
 
+@dataclass
+class ExecutionPlanStep:
+    step_id: str
+    step_type: str
+    source_node: str | None = None
+    target_node: str | None = None
+    known: str = ""
+    known_node_label: str = ""
+    ask: str = ""
+    relation_hint: str = ""
+    answer_variable: str | None = None
+    operator: str | None = None
+    inputs: list[str] = field(default_factory=list)
+    semantic_inputs: list[str] = field(default_factory=list)
+    output: str = "answer"
+    cue_text: str = ""
+    ast_edge: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ExecutionPlan:
+    steps: list[ExecutionPlanStep] = field(default_factory=list)
+    node_bindings: dict[str, list[str]] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def _token_label(word: str, index: int) -> str:
     if index <= 0:
         return word

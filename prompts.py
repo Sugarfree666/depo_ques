@@ -49,6 +49,12 @@ Mask:
 - continuous multi-word named entities such as New York City or University of Southern California
 - multi-word type variables or functional noun phrases such as distribution network, artificial intelligence company, mixed-use space, or local food distribution network
 
+Semantic type hints:
+- Choose a semantic_type_hint that preserves the original POS/semantic role for placeholder generation.
+- Person names in human contexts such as who/whom/whose, older/younger, actor, CEO, director, author, player, or president should use semantic_type_hint: Person.
+- Location names should use City/Country/Location when the question context asks for places.
+- Organizations and institutions should use Company/Organization/University/Institution when supported by the span or context.
+
 Do not mask simple one-word type variables by default:
 director, CEO, university, city, nationality, age, population, country, actor.
 
@@ -139,6 +145,7 @@ SEMANTIC_AST_OPTIMIZATION_SYSTEM = """
 You are implementing DEPO Step 6: semantic AST optimization.
 The input subgraph is an undirected syntactic/evidence subgraph with restored node text for display.
 Use the original question and selected explicit anchors to build a directed semantic AST suitable for one-hop atomic subquestion generation.
+The directed AST is a reasoning DAG: each edge must point from an already-known or already-bound node to the next node that should be solved.
 This is the only step that may create implicit type variables and choose a primary operator.
 Choose exactly one primary_operator from the allowed operator set. Use NONE when there is no comparison, superlative, set, or logical cue.
 Do not invent entities that are not present in the original question or mask mapping.
@@ -212,7 +219,17 @@ Rules:
 - You may add implicit type variables only when grounded by a cue in the original question.
 - Implicit variables must include cue_text and grounding_text.
 - You may split parallel branches and copy shared variables, e.g. nationality -> nationality_1 and nationality_2.
-- Convert the undirected evidence graph into directed semantic edges.
+- Node id may carry branch suffixes such as director_1 or nationality_2, but node label must be clean natural-language text such as director or nationality.
+- Do not put edge/relation phrases into node labels. For example, label the node nationality, not nationality of director.
+- Put phrases such as director of film or nationality of director only in edge.relation_hint.
+- Convert the undirected evidence graph into directed semantic edges whose direction follows inference, not surface syntax.
+- Direction rule: source is a known constant/entity or a previously solved variable; target is the next variable/value to solve.
+- If explicit named entities exist, start each branch from those entities and move toward answer variables or operator inputs.
+- If no explicit entity exists, start from the answer candidate type or comparison subject, then move toward attributes used for constraints/operators.
+- For "Which university did the CEO of the company that developed AlphaGo graduate from?", the reasoning direction is AlphaGo -> company -> CEO -> university, not university -> CEO -> company -> AlphaGo.
+- For "Do film A and film B share the same nationality?", use film A -> director_1 -> nationality_1 and film B -> director_2 -> nationality_2.
+- For "Which country has the largest population?", use country -> population, with ARGMAX over population.
+- The primary operator will be represented as an operator node by the system; primary_operator.inputs must name the branch endpoint node ids consumed by the operator.
 - Keep selected anchors unless you provide an explicit reason in the node/edge choices.
 - Do not create entities that are absent from selected anchors or mask mappings.
 - Do not generate atomic subquestions.
@@ -226,8 +243,55 @@ ATOMIC_SUBQUESTION_GENERATION_SYSTEM = """
 You are implementing DEPO Step 8: LLM-based atomic subquestion generation.
 Generate exactly one atomic subquestion for the provided one-hop semantic AST edge, or exactly one operator step for the provided primary operator.
 Use the original question and semantic AST context, but do not combine multiple AST edges into a multi-hop question.
+The input edge is already oriented as source/bound node -> target node to solve.
+If the source is bound to an answer variable such as X1, use that variable in the question instead of expanding the original source label.
 For ordinary attribute edges, do not include operator cue words such as same, older, largest, before, or after.
 Return valid JSON only.
+""".strip()
+
+
+ATOMIC_PLAN_STEP_SURFACE_SYSTEM = """
+You are implementing DEPO Step 8 surface realization for one deterministic execution-plan step.
+The semantic AST has already been compiled into a variable-bound execution DAG by code.
+Do not re-plan, reorder, infer hidden hops, merge steps, or use any node not present in this single plan step.
+For an edge step, generate one question whose answer is answer_variable.
+Use step.known as the known subject exactly; if it is X1, X2, or another variable, the exact variable must appear in the question.
+For an operator step, generate one question that applies step.operator to step.inputs exactly.
+Do not include comparative/superlative/operator cue words in ordinary edge questions.
+Return valid JSON only.
+""".strip()
+
+
+def build_atomic_plan_step_surface_prompt(
+    original_question: str,
+    plan_step: dict[str, object],
+) -> str:
+    schema = {
+        "question": "What is the nationality of X1?",
+        "answer_variable": "X2",
+        "explanation": "This surfaces only the provided execution step.",
+    }
+    return f"""
+Generate one atomic subquestion from this already-compiled execution-plan step.
+
+Original question:
+{original_question}
+
+Execution-plan step:
+{json.dumps(plan_step, ensure_ascii=False, indent=2)}
+
+Rules:
+- Do not infer a different step from the original question.
+- Do not use the full AST or any unstated path.
+- For step_type=edge, ask only for step.ask of step.known using step.relation_hint as wording guidance.
+- The answer to an edge step will be step.answer_variable.
+- If step.known is an answer variable such as X1, X2, or X1_nationality, that exact variable must appear in the question.
+- If step.known is a variable, do not expand it back into step.known_node_label or the original entity/path.
+- For ordinary edge steps, do not include operator cue words such as same, different, older, younger, largest, highest, first, before, or after.
+- For step_type=operator, mention the variables in step.inputs directly and apply step.operator. Do not ask another attribute question.
+
+Output JSON with exactly this shape:
+{json.dumps(schema, ensure_ascii=False, indent=2)}
 """.strip()
 
 
@@ -267,10 +331,14 @@ Primary operator:
 
 Rules:
 - For a directed one-hop edge, generate exactly one question for that edge only.
+- Treat current_edge.source_display as the known subject. Treat current_edge.target_label as the value to ask for.
+- If current_edge.source_display is X1, X2, or another variable, that exact variable must appear in the generated question.
+- When current_edge.source_display is a variable, do not also expand it back into the original path or source label. For example, ask "What is the nationality of X1?", not "For X1, what is the nationality of the director of FilmA?"
+- The answer to this subquestion will be current_edge.answer_variable.
 - Do not merge this edge with another edge.
 - Do not include same/older/largest/comparative/superlative cue words in ordinary attribute questions.
 - For an implicit variable edge such as actor -> age, ask a normal attribute question such as "What is the age of the actor?"
-- For an operator step, generate a question or structured step that applies the operator to its inputs.
+- For an operator step, generate a question that applies the operator to current_edge.inputs. Mention those input variables directly.
 
 Output JSON with exactly this shape:
 {json.dumps(schema, ensure_ascii=False, indent=2)}

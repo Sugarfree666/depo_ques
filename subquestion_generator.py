@@ -6,10 +6,21 @@ from typing import TYPE_CHECKING
 
 import networkx as nx
 
-from models import ASTResult, AtomicSubquestion, ExtractionResult, SemanticASTEdge, SemanticASTNode, SemanticASTResult
+from models import (
+    ASTResult,
+    AtomicSubquestion,
+    ExecutionPlan,
+    ExecutionPlanStep,
+    ExtractionResult,
+    SemanticASTEdge,
+    SemanticASTNode,
+    SemanticASTResult,
+)
 from prompts import (
+    ATOMIC_PLAN_STEP_SURFACE_SYSTEM,
     ATOMIC_SUBQUESTION_GENERATION_SYSTEM,
     ONE_HOP_SUBQUESTION_SYSTEM,
+    build_atomic_plan_step_surface_prompt,
     build_atomic_subquestion_generation_prompt,
     build_one_hop_prompt,
 )
@@ -52,49 +63,64 @@ class SubquestionGenerator:
         original_question: str,
         semantic_ast: SemanticASTResult,
     ) -> list[AtomicSubquestion]:
-        node_by_id = semantic_ast.node_by_id()
+        execution_plan = compile_execution_plan(semantic_ast)
         questions: list[AtomicSubquestion] = []
-        for edge in semantic_ast.edges:
-            source_node = node_by_id.get(edge.source)
-            target_node = node_by_id.get(edge.target)
-            answer_variable = f"X{len(questions) + 1}"
-            question_text, source = self._semantic_edge_question(
+        for plan_step in execution_plan.steps:
+            question_text, source = self._surface_plan_step(
                 original_question=original_question,
-                semantic_ast=semantic_ast,
-                edge=edge,
-                source_node=source_node,
-                target_node=target_node,
-                answer_variable=answer_variable,
+                plan_step=plan_step,
             )
             questions.append(
                 AtomicSubquestion(
                     index=len(questions) + 1,
                     question=question_text,
-                    answer_variable=answer_variable,
-                    source_node=edge.source,
-                    target_node=edge.target,
-                    type="edge",
+                    answer_variable=plan_step.answer_variable,
+                    source_node=plan_step.source_node,
+                    target_node=plan_step.target_node,
+                    operator=plan_step.operator,
+                    type="operator_step" if plan_step.step_type == "operator" else "edge",
                     source=source,
-                    ast_edge=edge.to_dict(),
-                )
-            )
-
-        if semantic_ast.primary_operator.operator != "NONE":
-            question_text, source = self._semantic_operator_question(
-                original_question=original_question,
-                semantic_ast=semantic_ast,
-            )
-            questions.append(
-                AtomicSubquestion(
-                    index=len(questions) + 1,
-                    question=question_text,
-                    answer_variable=None,
-                    operator=semantic_ast.primary_operator.operator,
-                    type="operator_step",
-                    source=source,
+                    ast_edge=plan_step.ast_edge,
                 )
             )
         return questions
+
+    def _surface_plan_step(
+        self,
+        original_question: str,
+        plan_step: ExecutionPlanStep,
+    ) -> tuple[str, str]:
+        try:
+            payload = self.llm_client.chat_json(
+                ATOMIC_PLAN_STEP_SURFACE_SYSTEM,
+                build_atomic_plan_step_surface_prompt(
+                    original_question=original_question,
+                    plan_step=plan_step.to_dict(),
+                ),
+            )
+            question = str(payload.get("question", "")).strip()
+            if not question:
+                raise ValueError("empty question")
+            if plan_step.step_type == "operator":
+                if not _operator_question_uses_inputs(question, plan_step.inputs):
+                    raise ValueError("operator question did not use bound operator inputs")
+                return question, "llm"
+            if _contains_operator_cue(question):
+                raise ValueError("ordinary edge question included operator cue")
+            if _expands_bound_source(question, plan_step.known, plan_step.known_node_label):
+                raise ValueError("ordinary edge question expanded an already-bound source variable")
+            question = _enforce_source_variable_binding(
+                question,
+                plan_step.known,
+                plan_step.known_node_label,
+            )
+            if _is_answer_variable(plan_step.known) and not _contains_variable(question, plan_step.known):
+                raise ValueError("ordinary edge question omitted bound source variable")
+            return question, "llm"
+        except Exception:
+            if plan_step.step_type == "operator":
+                return _operator_question(plan_step.operator or "NONE", plan_step.inputs), "fallback_template"
+            return _fallback_plan_edge_question(plan_step), "fallback_template"
 
     def _semantic_edge_question(
         self,
@@ -103,12 +129,20 @@ class SubquestionGenerator:
         edge: SemanticASTEdge,
         source_node: SemanticASTNode | None,
         target_node: SemanticASTNode | None,
+        source_display: str,
+        source_original: str,
         answer_variable: str,
     ) -> tuple[str, str]:
         prompt = build_atomic_subquestion_generation_prompt(
             original_question=original_question,
             semantic_ast=semantic_ast.to_dict(),
-            current_edge={**edge.to_dict(), "answer_variable": answer_variable},
+            current_edge={
+                **edge.to_dict(),
+                "source_display": source_display,
+                "source_label": source_original,
+                "target_label": target_node.label if target_node is not None else edge.target,
+                "answer_variable": answer_variable,
+            },
             source_node=source_node.to_dict() if source_node else None,
             target_node=target_node.to_dict() if target_node else None,
             primary_operator=semantic_ast.primary_operator.to_dict(),
@@ -120,20 +154,24 @@ class SubquestionGenerator:
                 raise ValueError("empty question")
             if _contains_operator_cue(question) and edge.edge_type != "operator":
                 raise ValueError("ordinary edge question included operator cue")
-            return question, "llm"
+            if _expands_bound_source(question, source_display, source_original):
+                raise ValueError("ordinary edge question expanded an already-bound source variable")
+            return _enforce_source_variable_binding(question, source_display, source_original), "llm"
         except Exception:
-            return _fallback_semantic_edge_question(source_node, target_node), "fallback_template"
+            return _fallback_semantic_edge_question(source_display, target_node), "fallback_template"
 
     def _semantic_operator_question(
         self,
         original_question: str,
         semantic_ast: SemanticASTResult,
+        operator_inputs: list[str],
     ) -> tuple[str, str]:
         operator = semantic_ast.primary_operator
         current_edge = {
             "type": "operator_step",
             "operator": operator.operator,
-            "inputs": operator.inputs,
+            "inputs": operator_inputs,
+            "semantic_inputs": operator.inputs,
             "output": operator.output,
             "cue_text": operator.cue_text,
         }
@@ -152,9 +190,11 @@ class SubquestionGenerator:
             question = str(payload.get("question", "")).strip()
             if not question:
                 raise ValueError("empty operator question")
+            if not _operator_question_uses_inputs(question, operator_inputs):
+                raise ValueError("operator question did not use bound operator inputs")
             return question, "llm"
         except Exception:
-            return _operator_question(operator.operator, operator.inputs), "fallback_template"
+            return _operator_question(operator.operator, operator_inputs), "fallback_template"
 
     def _generate_general(
         self,
@@ -480,12 +520,249 @@ def _contains_operator_cue(question: str) -> bool:
     return bool(words & cues)
 
 
-def _fallback_semantic_edge_question(
+def _expands_bound_source(question: str, source_display: str, source_original: str) -> bool:
+    if not _is_answer_variable(source_display):
+        return False
+    if not _contains_variable(question, source_display):
+        return True
+    original = source_original.strip()
+    if not original or _is_answer_variable(original):
+        return False
+    words = re.findall(r"[A-Za-z0-9]+", original)
+    if not words:
+        return False
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9_])" + r"\s+".join(re.escape(word) for word in words) + r"(?![A-Za-z0-9_])",
+        flags=re.IGNORECASE,
+    )
+    return bool(pattern.search(question))
+
+
+def _operator_question_uses_inputs(question: str, operator_inputs: list[str]) -> bool:
+    if not operator_inputs:
+        return True
+    return all(_contains_variable(question, item) for item in operator_inputs if _is_answer_variable(item))
+
+
+def _ordered_semantic_edges(semantic_ast: SemanticASTResult) -> list[SemanticASTEdge]:
+    if not semantic_ast.edges:
+        return []
+    graph = nx.DiGraph()
+    node_order = {node.id: index for index, node in enumerate(semantic_ast.nodes)}
+    edge_order: dict[tuple[str, str], int] = {}
+    edge_by_pair: dict[tuple[str, str], SemanticASTEdge] = {}
+    for index, edge in enumerate(semantic_ast.edges):
+        graph.add_edge(edge.source, edge.target)
+        edge_order.setdefault((edge.source, edge.target), index)
+        edge_by_pair.setdefault((edge.source, edge.target), edge)
+    if not nx.is_directed_acyclic_graph(graph):
+        return list(semantic_ast.edges)
+
+    roots = sorted(
+        [node for node in graph.nodes if graph.in_degree(node) == 0],
+        key=lambda node: node_order.get(node, 10**9),
+    )
+    ordered: list[SemanticASTEdge] = []
+    visited_edges: set[tuple[str, str]] = set()
+
+    def visit(node: str) -> None:
+        outgoing = sorted(
+            graph.successors(node),
+            key=lambda target: (
+                edge_order.get((node, target), 10**9),
+                node_order.get(target, 10**9),
+            ),
+        )
+        for target in outgoing:
+            key = (node, target)
+            if key in visited_edges:
+                continue
+            visited_edges.add(key)
+            edge = edge_by_pair.get(key)
+            if edge is not None:
+                ordered.append(edge)
+            visit(target)
+
+    for root in roots:
+        visit(root)
+    for edge in semantic_ast.edges:
+        key = (edge.source, edge.target)
+        if key not in visited_edges:
+            ordered.append(edge)
+            visited_edges.add(key)
+    return ordered
+
+
+def _bound_source_display(
     source_node: SemanticASTNode | None,
+    node_bindings: dict[str, list[str]],
+) -> str:
+    if source_node is None:
+        return "the source"
+    bindings = node_bindings.get(source_node.id, [])
+    if bindings:
+        return bindings[-1]
+    return source_node.label
+
+
+def _operator_input_variables(
+    semantic_ast: SemanticASTResult,
+    node_bindings: dict[str, list[str]],
+) -> list[str]:
+    variables: list[str] = []
+    for semantic_input in semantic_ast.primary_operator.inputs:
+        bindings = node_bindings.get(semantic_input, [])
+        if bindings:
+            variables.extend(bindings)
+        else:
+            variables.append(semantic_input)
+    return variables
+
+
+def compile_execution_plan(semantic_ast: SemanticASTResult) -> ExecutionPlan:
+    """Compile a directed semantic AST into a deterministic variable-bound DAG.
+
+    The AST stores semantic structure. This plan stores execution order and
+    variable bindings, so the LLM only surfaces a single already-decided step.
+    """
+
+    node_by_id = semantic_ast.node_by_id()
+    node_bindings: dict[str, list[str]] = {}
+    warnings: list[str] = []
+    steps: list[ExecutionPlanStep] = []
+    serial = 1
+
+    for edge in _ordered_ordinary_semantic_edges(semantic_ast):
+        source_node = node_by_id.get(edge.source)
+        target_node = node_by_id.get(edge.target)
+        if source_node is None or target_node is None:
+            warnings.append(f"Skipped execution edge with missing endpoint: {edge.source}->{edge.target}.")
+            continue
+
+        answer_variable = f"X{serial}"
+        serial += 1
+        known = _node_binding_display(source_node, node_bindings)
+        step = ExecutionPlanStep(
+            step_id=f"q{len(steps) + 1}",
+            step_type="edge",
+            source_node=edge.source,
+            target_node=edge.target,
+            known=known,
+            known_node_label=source_node.label,
+            ask=target_node.label,
+            relation_hint=edge.relation_hint,
+            answer_variable=answer_variable,
+            ast_edge=edge.to_dict(),
+        )
+        steps.append(step)
+        node_bindings.setdefault(edge.target, []).append(answer_variable)
+
+    if semantic_ast.primary_operator.operator != "NONE":
+        semantic_inputs = _operator_semantic_inputs(semantic_ast)
+        operator_inputs = _operator_input_variables_for_inputs(semantic_inputs, node_bindings)
+        steps.append(
+            ExecutionPlanStep(
+                step_id=f"q{len(steps) + 1}",
+                step_type="operator",
+                operator=semantic_ast.primary_operator.operator,
+                inputs=operator_inputs,
+                semantic_inputs=semantic_inputs,
+                output=semantic_ast.primary_operator.output,
+                cue_text=semantic_ast.primary_operator.cue_text,
+                answer_variable=None,
+            )
+        )
+
+    return ExecutionPlan(steps=steps, node_bindings=node_bindings, warnings=warnings)
+
+
+def _ordered_ordinary_semantic_edges(semantic_ast: SemanticASTResult) -> list[SemanticASTEdge]:
+    ordinary_edges = [edge for edge in semantic_ast.edges if edge.edge_type != "operator"]
+    if len(ordinary_edges) == len(semantic_ast.edges):
+        return _ordered_semantic_edges(semantic_ast)
+    ordinary_ast = SemanticASTResult(
+        status=semantic_ast.status,
+        primary_operator=semantic_ast.primary_operator,
+        nodes=semantic_ast.nodes,
+        edges=ordinary_edges,
+        warnings=semantic_ast.warnings,
+        raw_payload=semantic_ast.raw_payload,
+    )
+    return _ordered_semantic_edges(ordinary_ast)
+
+
+def _node_binding_display(
+    node: SemanticASTNode,
+    node_bindings: dict[str, list[str]],
+) -> str:
+    bindings = node_bindings.get(node.id, [])
+    if bindings:
+        return bindings[-1]
+    return node.label
+
+
+def _operator_semantic_inputs(semantic_ast: SemanticASTResult) -> list[str]:
+    if semantic_ast.primary_operator.inputs:
+        return list(semantic_ast.primary_operator.inputs)
+    operator_node_ids = {
+        node.id
+        for node in semantic_ast.nodes
+        if node.kind == "operator" and node.label == semantic_ast.primary_operator.operator
+    }
+    return [
+        edge.source
+        for edge in semantic_ast.edges
+        if edge.edge_type == "operator" and edge.target in operator_node_ids
+    ]
+
+
+def _operator_input_variables_for_inputs(
+    semantic_inputs: list[str],
+    node_bindings: dict[str, list[str]],
+) -> list[str]:
+    variables: list[str] = []
+    for semantic_input in semantic_inputs:
+        bindings = node_bindings.get(semantic_input, [])
+        if bindings:
+            variables.extend(bindings)
+        else:
+            variables.append(semantic_input)
+    return variables
+
+
+def _fallback_semantic_edge_question(
+    source_display: str,
     target_node: SemanticASTNode | None,
 ) -> str:
-    source = source_node.label if source_node is not None else "the source"
     target = target_node.label if target_node is not None else "the target"
     if target_node is not None and target_node.kind in {"type_variable", "implicit_type_variable"}:
-        return f"What is the {target} of {source}?"
-    return f"What is the {target} related to {source}?"
+        return f"What is the {target} of {source_display}?"
+    return f"What is the {target} related to {source_display}?"
+
+
+def _fallback_plan_edge_question(plan_step: ExecutionPlanStep) -> str:
+    known = plan_step.known or "the source"
+    ask = plan_step.ask or "value"
+    relation = plan_step.relation_hint.lower()
+    if _is_person_answer_label(ask):
+        return f"Who is the {ask} of {known}?"
+    if relation.startswith(("develop", "create", "invent", "found", "write", "direct")):
+        return f"What {ask} is related to {known}?"
+    return f"What is the {ask} of {known}?"
+
+
+def _is_person_answer_label(label: str) -> bool:
+    normalized = label.strip().lower()
+    person_labels = {
+        "actor",
+        "author",
+        "ceo",
+        "director",
+        "founder",
+        "person",
+        "player",
+        "president",
+        "producer",
+        "writer",
+    }
+    return normalized in person_labels or normalized.endswith((" actor", " author", " director", " person"))

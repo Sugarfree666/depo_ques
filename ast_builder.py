@@ -201,15 +201,16 @@ def _parse_primary_operator(
 def _parse_semantic_node(
     raw: Any,
     valid_graph_node_ids: set[str],
+    label_by_graph_node: dict[str, str],
     selected_entity_texts: set[str],
     warnings: list[str],
 ) -> SemanticASTNode | None:
     if not isinstance(raw, dict):
         return None
     node_id = str(raw.get("id", "")).strip()
-    label = str(raw.get("label", "")).strip()
+    raw_label = str(raw.get("label", "")).strip()
     kind = str(raw.get("kind", "")).strip()
-    if not node_id or not label or kind not in {
+    if not node_id or not raw_label or kind not in {
         "entity",
         "type_variable",
         "implicit_type_variable",
@@ -230,6 +231,15 @@ def _parse_semantic_node(
         source_graph_nodes = [item for item in source_graph_nodes if item in valid_graph_node_ids]
 
     source = str(raw.get("source", "derived") or "derived")
+    grounding_text = str(raw.get("grounding_text", "") or "")
+    label = _normalize_semantic_node_label(
+        node_id=node_id,
+        raw_label=raw_label,
+        kind=kind,
+        grounding_text=grounding_text,
+        source_graph_nodes=source_graph_nodes,
+        label_by_graph_node=label_by_graph_node,
+    )
     if kind == "implicit_type_variable" and not (
         str(raw.get("cue_text", "") or "").strip()
         or str(raw.get("created_from_cue", "") or "").strip()
@@ -261,7 +271,7 @@ def _parse_semantic_node(
         source=source,
         source_graph_nodes=source_graph_nodes,
         source_token_indices=coerced_token_indices,
-        grounding_text=str(raw.get("grounding_text", "") or ""),
+        grounding_text=grounding_text,
         cue_text=str(raw.get("cue_text", raw.get("created_from_cue", "")) or ""),
     )
 
@@ -292,6 +302,65 @@ def _parse_semantic_edge(
         support_path=[str(item) for item in support_path],
         support_dependency_relations=[str(item) for item in relations],
     )
+
+
+def _normalize_semantic_node_label(
+    node_id: str,
+    raw_label: str,
+    kind: str,
+    grounding_text: str,
+    source_graph_nodes: list[str],
+    label_by_graph_node: dict[str, str],
+) -> str:
+    if kind == "operator":
+        return raw_label
+
+    graph_labels = [
+        label_by_graph_node[node_id]
+        for node_id in source_graph_nodes
+        if node_id in label_by_graph_node and label_by_graph_node[node_id].strip()
+    ]
+    graph_label = graph_labels[0] if graph_labels else ""
+
+    label = raw_label.strip()
+    if _is_bad_semantic_label(label, node_id, kind):
+        if grounding_text and not _is_bad_semantic_label(grounding_text, node_id, kind):
+            label = grounding_text.strip()
+        elif graph_label:
+            label = graph_label.strip()
+        else:
+            label = _identifier_to_label(label or node_id)
+
+    if kind in {"type_variable", "implicit_type_variable", "variable"} and graph_label:
+        if _looks_like_relation_phrase(label) and not _looks_like_relation_phrase(graph_label):
+            label = graph_label.strip()
+
+    if _looks_like_identifier(label):
+        label = _identifier_to_label(label)
+    return label or raw_label
+
+
+def _is_bad_semantic_label(label: str, node_id: str, kind: str) -> bool:
+    if not label:
+        return True
+    if label == node_id:
+        return True
+    if kind in {"type_variable", "implicit_type_variable", "variable"} and _looks_like_identifier(label):
+        return True
+    return False
+
+
+def _looks_like_identifier(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9]*_[0-9]+", value.strip()))
+
+
+def _identifier_to_label(value: str) -> str:
+    text = re.sub(r"_[0-9]+$", "", value.strip())
+    return text.replace("_", " ")
+
+
+def _looks_like_relation_phrase(value: str) -> bool:
+    return bool(re.search(r"\b(of|by|from|in|for|to|with|that|who|which)\b", value.lower()))
 
 
 def _fallback_semantic_ast(
@@ -346,6 +415,274 @@ def _fallback_semantic_ast(
         warnings=warnings,
         raw_payload=raw_payload,
     )
+
+
+def _orient_edges_for_inference(
+    original_question: str,
+    nodes: list[SemanticASTNode],
+    edges: list[SemanticASTEdge],
+    primary_operator: SemanticASTPrimaryOperator,
+    warnings: list[str],
+) -> list[SemanticASTEdge]:
+    if len(edges) <= 1:
+        return edges
+
+    node_by_id = {node.id: node for node in nodes}
+    roots = _infer_inference_roots(original_question, nodes, primary_operator)
+    if not roots:
+        return edges
+
+    graph = nx.Graph()
+    for node in nodes:
+        graph.add_node(node.id)
+    edge_lookup: dict[frozenset[str], SemanticASTEdge] = {}
+    for edge in edges:
+        key = frozenset({edge.source, edge.target})
+        if len(key) != 2:
+            continue
+        graph.add_edge(edge.source, edge.target)
+        edge_lookup.setdefault(key, edge)
+
+    oriented_edges: list[SemanticASTEdge] = []
+    used_keys: set[frozenset[str]] = set()
+    for component in nx.connected_components(graph):
+        component_roots = [root for root in roots if root in component]
+        if not component_roots:
+            component_roots = [_best_component_root(component, node_by_id, original_question, primary_operator)]
+        distances = _multi_source_distances(graph.subgraph(component), component_roots)
+        component_edges = sorted(
+            graph.subgraph(component).edges,
+            key=lambda item: (
+                min(distances.get(item[0], 10**9), distances.get(item[1], 10**9)),
+                max(distances.get(item[0], 10**9), distances.get(item[1], 10**9)),
+                item[0],
+                item[1],
+            ),
+        )
+        for source, target in component_edges:
+            key = frozenset({source, target})
+            edge = edge_lookup.get(key)
+            if edge is None or key in used_keys:
+                continue
+            source_distance = distances.get(source, 10**9)
+            target_distance = distances.get(target, 10**9)
+            if target_distance < source_distance:
+                source, target = target, source
+            used_keys.add(key)
+            oriented_edges.append(_copy_edge_with_direction(edge, source, target, warnings))
+
+    for edge in edges:
+        key = frozenset({edge.source, edge.target})
+        if key not in used_keys:
+            oriented_edges.append(edge)
+    return oriented_edges
+
+
+def _materialize_operator_node(
+    nodes: list[SemanticASTNode],
+    edges: list[SemanticASTEdge],
+    primary_operator: SemanticASTPrimaryOperator,
+) -> None:
+    if primary_operator.operator == "NONE":
+        return
+    existing_node_ids = {node.id for node in nodes}
+    operator_node_id = _operator_node_id(primary_operator.operator, existing_node_ids)
+    if operator_node_id not in existing_node_ids:
+        nodes.append(
+            SemanticASTNode(
+                id=operator_node_id,
+                label=primary_operator.operator,
+                kind="operator",
+                semantic_type="Operator",
+                source="operator_from_cue",
+                grounding_text=primary_operator.cue_text,
+                cue_text=primary_operator.cue_text,
+            )
+        )
+    existing_edges = {(edge.source, edge.target, edge.edge_type) for edge in edges}
+    for input_node in primary_operator.inputs:
+        key = (input_node, operator_node_id, "operator")
+        if key in existing_edges:
+            continue
+        edges.append(
+            SemanticASTEdge(
+                source=input_node,
+                target=operator_node_id,
+                edge_type="operator",
+                relation_hint=primary_operator.operator,
+                support_path=[primary_operator.cue_text] if primary_operator.cue_text else [],
+                support_dependency_relations=[],
+            )
+        )
+
+
+def _operator_node_id(operator: str, existing_node_ids: set[str]) -> str:
+    base = "operator_" + operator.lower()
+    if base not in existing_node_ids:
+        return base
+    index = 2
+    while f"{base}_{index}" in existing_node_ids:
+        index += 1
+    return f"{base}_{index}"
+
+
+def _infer_inference_roots(
+    original_question: str,
+    nodes: list[SemanticASTNode],
+    primary_operator: SemanticASTPrimaryOperator,
+) -> list[str]:
+    entity_roots = [
+        node.id
+        for node in nodes
+        if node.kind == "entity" and node.source in {"selected_anchor", "mask", "derived"}
+    ]
+    if entity_roots:
+        return entity_roots
+
+    explicit_type_nodes = [node for node in nodes if node.kind == "type_variable"]
+    if primary_operator.operator in {"COMPARE_GREATER", "COMPARE_LESS"}:
+        comparison_subjects = [
+            node.id
+            for node in explicit_type_nodes
+            if node.id not in set(primary_operator.inputs)
+        ]
+        if comparison_subjects:
+            return comparison_subjects
+
+    if primary_operator.operator in {"ARGMAX", "ARGMIN"} and primary_operator.output:
+        output_roots = [node.id for node in nodes if node.id == primary_operator.output]
+        if output_roots:
+            return output_roots
+
+    focus_labels = _answer_focus_labels(original_question)
+    focus_roots = [
+        node.id
+        for node in explicit_type_nodes
+        if _norm(node.label) in focus_labels or any(_norm(part) in focus_labels for part in node.label.split())
+    ]
+    if focus_roots:
+        return focus_roots
+
+    if explicit_type_nodes:
+        return [explicit_type_nodes[0].id]
+    return []
+
+
+def _best_component_root(
+    component: set[str],
+    node_by_id: dict[str, SemanticASTNode],
+    original_question: str,
+    primary_operator: SemanticASTPrimaryOperator,
+) -> str:
+    focus_labels = _answer_focus_labels(original_question)
+
+    def score(node_id: str) -> tuple[int, int]:
+        node = node_by_id[node_id]
+        if node.kind == "entity":
+            kind_score = 0
+        elif node.kind == "type_variable" and node.id == primary_operator.output:
+            kind_score = 1
+        elif node.kind == "type_variable" and _norm(node.label) in focus_labels:
+            kind_score = 2
+        elif node.kind == "type_variable":
+            kind_score = 3
+        else:
+            kind_score = 4
+        return (kind_score, len(node_id))
+
+    return min(component, key=score)
+
+
+def _multi_source_distances(graph: nx.Graph, roots: list[str]) -> dict[str, int]:
+    distances: dict[str, int] = {}
+    queue: list[str] = []
+    for root in roots:
+        if root in graph and root not in distances:
+            distances[root] = 0
+            queue.append(root)
+    while queue:
+        current = queue.pop(0)
+        for neighbor in graph.neighbors(current):
+            if neighbor in distances:
+                continue
+            distances[neighbor] = distances[current] + 1
+            queue.append(neighbor)
+    return distances
+
+
+def _copy_edge_with_direction(
+    edge: SemanticASTEdge,
+    source: str,
+    target: str,
+    warnings: list[str],
+) -> SemanticASTEdge:
+    if edge.source == source and edge.target == target:
+        return edge
+    warnings.append(f"Reoriented semantic edge {edge.source}->{edge.target} to {source}->{target}.")
+    return SemanticASTEdge(
+        source=source,
+        target=target,
+        edge_type=edge.edge_type,
+        relation_hint=edge.relation_hint,
+        support_path=edge.support_path,
+        support_dependency_relations=edge.support_dependency_relations,
+    )
+
+
+def _answer_focus_labels(question: str) -> set[str]:
+    text = _norm(question)
+    labels: set[str] = set()
+    patterns = [
+        r"^(?:which|what)\s+([a-z][a-z0-9_-]*(?:\s+[a-z][a-z0-9_-]*){0,3})\b",
+        r"^(?:who)\b",
+        r"^what\s+is\s+(?:the|a|an)?\s*([a-z][a-z0-9_-]*(?:\s+[a-z][a-z0-9_-]*){0,3})\b",
+    ]
+    stop_words = {
+        "did",
+        "does",
+        "do",
+        "has",
+        "have",
+        "had",
+        "is",
+        "are",
+        "was",
+        "were",
+        "the",
+        "a",
+        "an",
+        "of",
+        "that",
+        "which",
+        "who",
+    }
+    cue_words = {
+        "different",
+        "highest",
+        "larger",
+        "largest",
+        "older",
+        "same",
+        "smallest",
+        "younger",
+    }
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        if pattern == r"^(?:who)\b":
+            labels.add("person")
+            labels.add("people")
+            continue
+        phrase = match.group(1)
+        words = [word for word in phrase.split() if word not in stop_words and word not in cue_words]
+        for index in range(len(words)):
+            labels.add(" ".join(words[index:]))
+        for word in words:
+            labels.add(word)
+        if words:
+            labels.add(words[-1])
+    return labels
 
 
 def _slug(value: str) -> str:
@@ -411,6 +748,7 @@ class SemanticASTOptimizer:
             warnings.append("Semantic AST optimization LLM unavailable; using fallback.")
 
         result = self._parse_and_validate(
+            original_question=original_question,
             payload=payload,
             selected_anchors=selected_anchor_list,
             restored_anchor_connected_subgraph=restored_anchor_connected_subgraph,
@@ -429,6 +767,7 @@ class SemanticASTOptimizer:
 
     def _parse_and_validate(
         self,
+        original_question: str,
         payload: dict[str, Any],
         selected_anchors: list[SelectedAnchor],
         restored_anchor_connected_subgraph: RestoredAnchorConnectedSubgraph,
@@ -441,6 +780,13 @@ class SemanticASTOptimizer:
             for node in restored_anchor_connected_subgraph.nodes
             if node.get("node_id") is not None
         } | {anchor.node_id for anchor in selected_anchors}
+        label_by_graph_node = {
+            str(node.get("node_id")): str(node.get("text", node.get("display_text", "")))
+            for node in restored_anchor_connected_subgraph.nodes
+            if node.get("node_id") is not None
+        }
+        for anchor in selected_anchors:
+            label_by_graph_node.setdefault(anchor.node_id, anchor.display_text)
         selected_entity_texts = {
             _norm(anchor.display_text)
             for anchor in selected_anchors
@@ -456,7 +802,13 @@ class SemanticASTOptimizer:
         nodes: list[SemanticASTNode] = []
         seen_ids: set[str] = set()
         for raw in raw_nodes:
-            node = _parse_semantic_node(raw, valid_graph_node_ids, selected_entity_texts, warnings)
+            node = _parse_semantic_node(
+                raw,
+                valid_graph_node_ids,
+                label_by_graph_node,
+                selected_entity_texts,
+                warnings,
+            )
             if node is None:
                 continue
             if node.id in seen_ids:
@@ -474,6 +826,13 @@ class SemanticASTOptimizer:
             edge = _parse_semantic_edge(raw, node_ids, warnings)
             if edge is not None:
                 edges.append(edge)
+        edges = _orient_edges_for_inference(
+            original_question=original_question,
+            nodes=nodes,
+            edges=edges,
+            primary_operator=primary_operator,
+            warnings=warnings,
+        )
 
         if primary_operator.operator != "NONE":
             missing_inputs = [item for item in primary_operator.inputs if item not in node_ids]
@@ -485,6 +844,8 @@ class SemanticASTOptimizer:
             if not primary_operator.cue_text and not primary_operator.explanation:
                 warnings.append("Non-NONE primary operator lacked cue_text/explanation; using NONE.")
                 primary_operator = SemanticASTPrimaryOperator(operator="NONE")
+            else:
+                _materialize_operator_node(nodes, edges, primary_operator)
 
         status = str(payload.get("status", "ok")).strip() or "ok"
         return SemanticASTResult(

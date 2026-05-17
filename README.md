@@ -63,13 +63,21 @@ anchor decisions are made on restored original question text.
 
    Examples: `same` maps to `COMPARE_SAME`; `older` can create an implicit
    `age` variable and choose `COMPARE_GREATER`; `largest population` chooses
-   `ARGMAX`.
+   `ARGMAX`. Non-`NONE` operators are materialized as AST operator nodes, and
+   branch endpoint variables point into that operator node.
 
-9. **LLM atomic subquestion generation**
-   Step 8 generates atomic subquestions from the final semantic AST. The LLM is
-   called once per directed one-hop AST edge, and an operator step is generated
-   separately from `primary_operator`. One atomic subquestion must correspond to
-   exactly one AST edge; multi-hop fusion is not allowed.
+9. **Execution DAG and atomic subquestion generation**
+   Step 8 first compiles the final semantic AST into a deterministic execution
+   DAG. This code layer decides edge order, variable bindings such as `X1` and
+   `X2`, and the final operator step. Operator nodes are AST join nodes, not
+   ordinary attribute hops.
+
+   The LLM then receives only one compiled plan step at a time. For an edge
+   step, it turns `known -> ask` into one atomic subquestion whose answer is the
+   assigned variable. For an operator step, it applies the operator to the bound
+   branch variables. The LLM is no longer allowed to see and re-plan the full AST
+   during subquestion generation, which prevents multi-hop fusion and accidental
+   expansion of already-bound variables.
 
 ## Run
 

@@ -43,6 +43,57 @@ TITLE_HEADS = {
     "work": "Work",
 }
 
+HUMAN_CONTEXT_CUES = {
+    "actor",
+    "actress",
+    "age",
+    "author",
+    "born",
+    "ceo",
+    "director",
+    "elder",
+    "eldest",
+    "founder",
+    "older",
+    "oldest",
+    "people",
+    "person",
+    "player",
+    "president",
+    "singer",
+    "who",
+    "whom",
+    "whose",
+    "younger",
+    "youngest",
+}
+
+NON_PERSON_NAME_WORDS = {
+    "academy",
+    "album",
+    "association",
+    "book",
+    "city",
+    "college",
+    "company",
+    "corporation",
+    "country",
+    "film",
+    "foundation",
+    "inc",
+    "institute",
+    "ltd",
+    "movie",
+    "network",
+    "organization",
+    "organisation",
+    "school",
+    "song",
+    "university",
+}
+
+PERSON_NAME_PARTICLES = {"al", "bin", "da", "de", "del", "der", "di", "la", "le", "van", "von"}
+
 CLAUSE_BOUNDARY = {
     "and",
     "or",
@@ -129,7 +180,14 @@ class MaskSpanExtractor:
                     start_char=start,
                     end_char=end,
                     kind_hint=kind_hint,
-                    semantic_type_hint=semantic_type_hint or _infer_semantic_type(question[start:end], kind_hint),
+                    semantic_type_hint=_refine_semantic_type(
+                        question=question,
+                        text=question[start:end],
+                        kind_hint=kind_hint,
+                        existing=semantic_type_hint,
+                        start=start,
+                        end=end,
+                    ),
                     reason=str(raw.get("reason", "")).strip(),
                 )
             )
@@ -221,7 +279,7 @@ def _parenthetical_entity_spans(question: str) -> list[MaskSpan]:
                     start_char=match.start(),
                     end_char=match.end(),
                     kind_hint="entity",
-                    semantic_type_hint=_infer_semantic_type(text, "entity"),
+                    semantic_type_hint=_infer_semantic_type(text, "entity", question, match.start(), match.end()),
                     reason="entity with parenthetical qualifier",
                 )
             )
@@ -241,7 +299,7 @@ def _quoted_spans(question: str) -> list[MaskSpan]:
                     start_char=start,
                     end_char=end,
                     kind_hint="entity",
-                    semantic_type_hint=_infer_semantic_type(text, "entity"),
+                    semantic_type_hint=_infer_semantic_type(text, "entity", question, start, end),
                     reason="quoted complex title/name",
                 )
             )
@@ -267,7 +325,7 @@ def _capitalized_entity_spans(question: str) -> list[MaskSpan]:
                 start_char=match.start(),
                 end_char=match.end(),
                 kind_hint="entity",
-                semantic_type_hint=_infer_semantic_type(text, "entity"),
+                semantic_type_hint=_infer_semantic_type(text, "entity", question, match.start(), match.end()),
                 reason="continuous multi-word named entity",
             )
         )
@@ -318,7 +376,14 @@ def _merge_spans(
                 start_char=start,
                 end_char=end,
                 kind_hint=_normalize_kind_hint(span.kind_hint),
-                semantic_type_hint=span.semantic_type_hint or _infer_semantic_type(text, span.kind_hint),
+                semantic_type_hint=_refine_semantic_type(
+                    question=question,
+                    text=text,
+                    kind_hint=span.kind_hint,
+                    existing=span.semantic_type_hint,
+                    start=start,
+                    end=end,
+                ),
                 reason=span.reason,
             )
         )
@@ -361,7 +426,13 @@ def _starts_sentence_only(question: str, start: int, text: str) -> bool:
     return first.group(0).lower() in {"what", "which", "who", "do", "does", "did", "is", "are"}
 
 
-def _infer_semantic_type(text: str, kind_hint: str) -> str:
+def _infer_semantic_type(
+    text: str,
+    kind_hint: str,
+    question: str = "",
+    start: int | None = None,
+    end: int | None = None,
+) -> str:
     lowered = text.lower()
     if "film" in lowered or "movie" in lowered:
         return "Film"
@@ -373,7 +444,76 @@ def _infer_semantic_type(text: str, kind_hint: str) -> str:
         return "University"
     if "city" in lowered:
         return "City"
+    if (
+        kind_hint == "entity"
+        and question
+        and _looks_like_person_name(text)
+        and _question_has_human_context(question, start, end)
+    ):
+        return "Person"
     return normalize_semantic_type(text, "entity" if kind_hint == "entity" else "type_variable")
+
+
+def _refine_semantic_type(
+    question: str,
+    text: str,
+    kind_hint: str,
+    existing: str | None,
+    start: int | None,
+    end: int | None,
+) -> str:
+    inferred = _infer_semantic_type(text, kind_hint, question, start, end)
+    existing = (existing or "").strip()
+    if not existing:
+        return inferred
+    if inferred == "Person" and _is_generic_or_surface_semantic_type(existing, text):
+        return inferred
+    return existing
+
+
+def _is_generic_or_surface_semantic_type(value: str, text: str) -> bool:
+    normalized_value = re.sub(r"[^A-Za-z0-9]+", "", value).lower()
+    surface_value = re.sub(r"[^A-Za-z0-9]+", "", text).lower()
+    return normalized_value in {
+        "",
+        "entity",
+        "someentity",
+        "namedentity",
+        "unknown",
+        "thing",
+        surface_value,
+    }
+
+
+def _looks_like_person_name(text: str) -> bool:
+    if re.search(r"\d|[:()\[\]{}\"']", text):
+        return False
+    words = re.findall(r"[A-Za-z][A-Za-z'-]*", text)
+    if len(words) < 2 or len(words) > 5:
+        return False
+    lowered_words = {word.lower().strip("'") for word in words}
+    if lowered_words & NON_PERSON_NAME_WORDS:
+        return False
+    content_words = [word for word in words if word.lower() not in PERSON_NAME_PARTICLES]
+    if len(content_words) < 2:
+        return False
+    return all(word[:1].isupper() or word.isupper() for word in content_words)
+
+
+def _question_has_human_context(
+    question: str,
+    start: int | None,
+    end: int | None,
+) -> bool:
+    lowered_words = set(re.findall(r"[A-Za-z]+", question.lower()))
+    if lowered_words & HUMAN_CONTEXT_CUES:
+        return True
+    if start is None or end is None:
+        return False
+    local_left = question[max(0, start - 40) : start].lower()
+    local_right = question[end : min(len(question), end + 40)].lower()
+    local_words = set(re.findall(r"[A-Za-z]+", f"{local_left} {local_right}"))
+    return bool(local_words & HUMAN_CONTEXT_CUES)
 
 
 def _normalize_kind_hint(value: object) -> str:

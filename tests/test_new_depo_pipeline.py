@@ -13,6 +13,7 @@ from models import (
     CoreNLPToken,
     DependencyEdge,
     DependencyParse,
+    RestoredAnchorConnectedSubgraph,
     RestoredGraphNodeCandidate,
     SemanticASTEdge,
     SemanticASTNode,
@@ -20,7 +21,7 @@ from models import (
     SemanticASTResult,
 )
 from placeholder import selective_entity_masking
-from subquestion_generator import SubquestionGenerator
+from subquestion_generator import SubquestionGenerator, compile_execution_plan
 
 
 class FakeLLM:
@@ -41,10 +42,40 @@ class AtomicFakeLLM:
 
     def chat_json(self, system_prompt: str, user_prompt: str, max_retries: int = 3) -> dict[str, object]:
         self.prompts.append(user_prompt)
-        if '"type": "operator_step"' in user_prompt:
-            return {"question": "Which actor is older?"}
-        if '"target": "age_1"' in user_prompt or '"id": "age_1"' in user_prompt:
+        if '"step_type": "operator"' in user_prompt:
+            return {"question": "Which is older, X1?"}
+        if '"target_node": "age_1"' in user_prompt or '"ask": "age"' in user_prompt:
             return {"question": "What is the age of the actor?"}
+        return {"question": "Who is the director of Ten9Eight: Shoot For The Moon?"}
+
+
+class DAGFakeLLM:
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    def chat_json(self, system_prompt: str, user_prompt: str, max_retries: int = 3) -> dict[str, object]:
+        self.prompts.append(user_prompt)
+        if '"step_type": "operator"' in user_prompt:
+            return {"question": "Are X2 and X4 the same?"}
+        if '"known": "X1"' in user_prompt:
+            return {"question": "What is the nationality of X1?"}
+        if '"known": "X3"' in user_prompt:
+            return {"question": "What is the nationality of X3?"}
+        if '"target_node": "director_2"' in user_prompt:
+            return {"question": "Who is the director of Sabotage (1936 Film)?"}
+        return {"question": "Who is the director of Ten9Eight: Shoot For The Moon?"}
+
+
+class BadBindingFakeLLM:
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    def chat_json(self, system_prompt: str, user_prompt: str, max_retries: int = 3) -> dict[str, object]:
+        self.prompts.append(user_prompt)
+        if '"step_type": "operator"' in user_prompt:
+            return {"question": "What is the nationality of the director of Ten9Eight: Shoot For The Moon?"}
+        if '"known": "X1"' in user_prompt:
+            return {"question": "For X1, what is the nationality of director of Ten9Eight: Shoot For The Moon?"}
         return {"question": "Who is the director of Ten9Eight: Shoot For The Moon?"}
 
 
@@ -164,6 +195,7 @@ class NewDEPOPipelineTests(unittest.TestCase):
         self.assertIn("director", selected_texts)
         self.assertIn("nationality", selected_texts)
         self.assertNotIn("same", selected_texts)
+        self.assertIn('"text": "Do"', fake_anchor_llm.prompts[0])
         self.assertNotIn("MovieA [Ten9Eight: Shoot For The Moon]", fake_anchor_llm.prompts[0])
 
         connected = graph_builder.build_anchor_connected_subgraph(
@@ -318,6 +350,26 @@ class NewDEPOPipelineTests(unittest.TestCase):
         mask_result = MaskSpanExtractor().extract(question)
         self.assertEqual(mask_result.mask_spans, [])
 
+    def test_person_name_masks_use_person_placeholders_from_human_context(self) -> None:
+        question = "Who is older, Ryan Tubridy or Mauro Massironi?"
+
+        mask_result = MaskSpanExtractor().extract(question)
+        replacement = selective_entity_masking(question, mask_result)
+
+        self.assertEqual(
+            [(span.text, span.semantic_type_hint) for span in mask_result.mask_spans],
+            [("Ryan Tubridy", "Person"), ("Mauro Massironi", "Person")],
+        )
+        self.assertEqual(replacement.masked_question, "Who is older, PersonA or PersonB?")
+
+    def test_capitalized_location_context_is_not_forced_to_person(self) -> None:
+        question = "Which city is larger, New York City or Los Angeles?"
+
+        mask_result = MaskSpanExtractor().extract(question)
+
+        semantic_types = {span.text: span.semantic_type_hint for span in mask_result.mask_spans}
+        self.assertNotEqual(semantic_types.get("Los Angeles"), "Person")
+
     def test_step4_validation_filters_illegal_cue_anchors(self) -> None:
         cues = ["same", "older", "largest", "and", "before"]
         candidates = [
@@ -385,7 +437,7 @@ class NewDEPOPipelineTests(unittest.TestCase):
         self.assertEqual(relation_weight("obj"), 1)
         self.assertEqual(relation_weight("nmod:of"), 3)
         self.assertEqual(relation_weight("compound"), 3)
-        self.assertTrue(relation_weight("conj:and") == float("inf"))
+        self.assertEqual(relation_weight("conj:and"), 10)
         self.assertEqual(relation_weight("det"), 5)
 
     def test_llm_atomic_subquestions_are_generated_per_semantic_one_hop_edge(self) -> None:
@@ -413,9 +465,9 @@ class NewDEPOPipelineTests(unittest.TestCase):
         )
         self.assertEqual(len(subquestions), 1)
         self.assertEqual(subquestions[0].question, "Who is the director of Ten9Eight: Shoot For The Moon?")
-        self.assertIn("Final semantic AST", fake_llm.prompts[0])
-        self.assertIn('"source": "movie_1"', fake_llm.prompts[0])
-        self.assertIn('"target": "director_1"', fake_llm.prompts[0])
+        self.assertIn("Execution-plan step", fake_llm.prompts[0])
+        self.assertIn('"source_node": "movie_1"', fake_llm.prompts[0])
+        self.assertIn('"target_node": "director_1"', fake_llm.prompts[0])
 
         compare_ast = SemanticASTResult(
             status="ok",
@@ -437,6 +489,235 @@ class NewDEPOPipelineTests(unittest.TestCase):
         self.assertNotIn("older", subquestions[0].question.lower())
         self.assertEqual(subquestions[-1].operator, "COMPARE_GREATER")
         self.assertIn("older", subquestions[-1].question.lower())
+
+    def test_semantic_ast_optimizer_reorients_edges_from_known_entity_to_answer_variable(self) -> None:
+        question = (
+            "Which university did the CEO of the artificial intelligence company that developed "
+            "AlphaGo graduate from?"
+        )
+        replacement = selective_entity_masking(question, MaskSpanExtractor().extract(question))
+        restored_subgraph = RestoredAnchorConnectedSubgraph(
+            nodes=[
+                {"node_id": "2", "text": "university"},
+                {"node_id": "5", "text": "CEO"},
+                {"node_id": "8", "text": "artificial intelligence company"},
+                {"node_id": "11", "text": "AlphaGo"},
+            ],
+        )
+        reversed_payload = {
+            "status": "ok",
+            "primary_operator": {"operator": "NONE", "inputs": [], "output": "university"},
+            "nodes": [
+                {"id": "university", "label": "university", "kind": "type_variable", "source": "selected_anchor", "source_graph_nodes": ["2"]},
+                {"id": "CEO", "label": "CEO", "kind": "type_variable", "source": "selected_anchor", "source_graph_nodes": ["5"]},
+                {"id": "CompanyA", "label": "artificial intelligence company", "kind": "type_variable", "source": "selected_anchor", "source_graph_nodes": ["8"]},
+                {"id": "AlphaGo", "label": "AlphaGo", "kind": "entity", "source": "selected_anchor", "source_graph_nodes": ["11"]},
+            ],
+            "edges": [
+                {"source": "university", "target": "CEO", "edge_type": "attribute", "relation_hint": "graduated from"},
+                {"source": "CEO", "target": "CompanyA", "edge_type": "attribute", "relation_hint": "CEO of"},
+                {"source": "CompanyA", "target": "AlphaGo", "edge_type": "attribute", "relation_hint": "developed"},
+            ],
+        }
+
+        semantic_ast = SemanticASTOptimizer(FakeLLM(reversed_payload)).optimize(
+            question,
+            replacement,
+            [],
+            restored_subgraph,
+        )
+
+        self.assertEqual(
+            [(edge.source, edge.target) for edge in semantic_ast.edges],
+            [("AlphaGo", "CompanyA"), ("CompanyA", "CEO"), ("CEO", "university")],
+        )
+
+    def test_semantic_ast_normalizes_node_labels_and_materializes_operator_node(self) -> None:
+        question = (
+            "Do director of film Ten9Eight: Shoot For The Moon and director of film "
+            "Sabotage (1936 Film) share the same nationality?"
+        )
+        replacement = selective_entity_masking(question, MaskSpanExtractor().extract(question))
+        restored_subgraph = RestoredAnchorConnectedSubgraph(
+            nodes=[
+                {"node_id": "8", "text": "Ten9Eight: Shoot For The Moon"},
+                {"node_id": "9", "text": "director"},
+                {"node_id": "13", "text": "nationality"},
+                {"node_id": "18", "text": "Sabotage (1936 Film)"},
+                {"node_id": "19", "text": "director"},
+            ],
+        )
+        payload = {
+            "status": "ok",
+            "primary_operator": {
+                "operator": "COMPARE_SAME",
+                "cue_text": "same",
+                "inputs": ["nationality_1", "nationality_2"],
+                "output": "answer",
+                "explanation": "same nationality comparison",
+            },
+            "nodes": [
+                {"id": "movie_1", "label": "Ten9Eight: Shoot For The Moon", "kind": "entity", "source": "selected_anchor", "source_graph_nodes": ["8"]},
+                {"id": "director_1", "label": "director_1", "kind": "type_variable", "source": "selected_anchor", "source_graph_nodes": ["9"]},
+                {"id": "nationality_1", "label": "nationality of director", "kind": "type_variable", "source": "selected_anchor", "source_graph_nodes": ["13"]},
+                {"id": "movie_2", "label": "Sabotage (1936 Film)", "kind": "entity", "source": "selected_anchor", "source_graph_nodes": ["18"]},
+                {"id": "director_2", "label": "director_2", "kind": "type_variable", "source": "selected_anchor", "source_graph_nodes": ["19"]},
+                {"id": "nationality_2", "label": "nationality_2", "kind": "type_variable", "source": "selected_anchor", "source_graph_nodes": ["13"]},
+            ],
+            "edges": [
+                {"source": "movie_1", "target": "director_1", "edge_type": "attribute", "relation_hint": "director of film"},
+                {"source": "director_1", "target": "nationality_1", "edge_type": "attribute", "relation_hint": "nationality of director"},
+                {"source": "movie_2", "target": "director_2", "edge_type": "attribute", "relation_hint": "director of film"},
+                {"source": "director_2", "target": "nationality_2", "edge_type": "attribute", "relation_hint": "nationality of director"},
+            ],
+        }
+
+        semantic_ast = SemanticASTOptimizer(FakeLLM(payload)).optimize(
+            question,
+            replacement,
+            [],
+            restored_subgraph,
+        )
+
+        labels = {node.id: node.label for node in semantic_ast.nodes}
+        self.assertEqual(labels["director_1"], "director")
+        self.assertEqual(labels["nationality_1"], "nationality")
+        self.assertEqual(labels["director_2"], "director")
+        self.assertEqual(labels["nationality_2"], "nationality")
+        self.assertIn("operator_compare_same", labels)
+        self.assertEqual(labels["operator_compare_same"], "COMPARE_SAME")
+        self.assertIn(
+            ("nationality_1", "operator_compare_same", "operator"),
+            {(edge.source, edge.target, edge.edge_type) for edge in semantic_ast.edges},
+        )
+        self.assertIn(
+            ("nationality_2", "operator_compare_same", "operator"),
+            {(edge.source, edge.target, edge.edge_type) for edge in semantic_ast.edges},
+        )
+
+    def test_subquestion_generation_uses_dag_order_and_bound_variables(self) -> None:
+        semantic_ast = SemanticASTResult(
+            status="ok",
+            primary_operator=SemanticASTPrimaryOperator(
+                operator="COMPARE_SAME",
+                inputs=["nationality_1", "nationality_2"],
+                output="answer",
+                cue_text="same",
+            ),
+            nodes=[
+                SemanticASTNode(id="movie_1", label="Ten9Eight: Shoot For The Moon", kind="entity"),
+                SemanticASTNode(id="director_1", label="director", kind="type_variable"),
+                SemanticASTNode(id="nationality_1", label="nationality", kind="type_variable"),
+                SemanticASTNode(id="movie_2", label="Sabotage (1936 Film)", kind="entity"),
+                SemanticASTNode(id="director_2", label="director", kind="type_variable"),
+                SemanticASTNode(id="nationality_2", label="nationality", kind="type_variable"),
+            ],
+            edges=[
+                SemanticASTEdge(source="movie_1", target="director_1", edge_type="attribute", relation_hint="director of film"),
+                SemanticASTEdge(source="director_1", target="nationality_1", edge_type="attribute", relation_hint="nationality of director"),
+                SemanticASTEdge(source="movie_2", target="director_2", edge_type="attribute", relation_hint="director of film"),
+                SemanticASTEdge(source="director_2", target="nationality_2", edge_type="attribute", relation_hint="nationality of director"),
+            ],
+        )
+
+        execution_plan = compile_execution_plan(semantic_ast)
+        self.assertEqual(
+            [(step.known, step.ask, step.answer_variable) for step in execution_plan.steps],
+            [
+                ("Ten9Eight: Shoot For The Moon", "director", "X1"),
+                ("X1", "nationality", "X2"),
+                ("Sabotage (1936 Film)", "director", "X3"),
+                ("X3", "nationality", "X4"),
+                ("", "", None),
+            ],
+        )
+        self.assertEqual(execution_plan.steps[-1].step_type, "operator")
+        self.assertEqual(execution_plan.steps[-1].inputs, ["X2", "X4"])
+
+        subquestions = SubquestionGenerator(DAGFakeLLM()).generate(
+            "Do the directors of Ten9Eight: Shoot For The Moon and Sabotage (1936 Film) have the same nationality?",
+            semantic_ast,
+        )
+
+        self.assertEqual([item.answer_variable for item in subquestions[:4]], ["X1", "X2", "X3", "X4"])
+        self.assertEqual(subquestions[1].question, "What is the nationality of X1?")
+        self.assertEqual(subquestions[3].question, "What is the nationality of X3?")
+        self.assertEqual(subquestions[4].question, "Are X2 and X4 the same?")
+
+    def test_execution_plan_ignores_materialized_operator_edges_as_ordinary_steps(self) -> None:
+        semantic_ast = SemanticASTResult(
+            status="ok",
+            primary_operator=SemanticASTPrimaryOperator(
+                operator="COMPARE_SAME",
+                inputs=["nationality_1", "nationality_2"],
+                output="answer",
+                cue_text="same",
+            ),
+            nodes=[
+                SemanticASTNode(id="movie_1", label="Ten9Eight: Shoot For The Moon", kind="entity"),
+                SemanticASTNode(id="director_1", label="director", kind="type_variable"),
+                SemanticASTNode(id="nationality_1", label="nationality", kind="type_variable"),
+                SemanticASTNode(id="movie_2", label="Sabotage (1936 Film)", kind="entity"),
+                SemanticASTNode(id="director_2", label="director", kind="type_variable"),
+                SemanticASTNode(id="nationality_2", label="nationality", kind="type_variable"),
+                SemanticASTNode(id="operator_compare_same", label="COMPARE_SAME", kind="operator"),
+            ],
+            edges=[
+                SemanticASTEdge(source="movie_1", target="director_1", edge_type="attribute", relation_hint="director of film"),
+                SemanticASTEdge(source="director_1", target="nationality_1", edge_type="attribute", relation_hint="nationality of director"),
+                SemanticASTEdge(source="movie_2", target="director_2", edge_type="attribute", relation_hint="director of film"),
+                SemanticASTEdge(source="director_2", target="nationality_2", edge_type="attribute", relation_hint="nationality of director"),
+                SemanticASTEdge(source="nationality_1", target="operator_compare_same", edge_type="operator", relation_hint="COMPARE_SAME"),
+                SemanticASTEdge(source="nationality_2", target="operator_compare_same", edge_type="operator", relation_hint="COMPARE_SAME"),
+            ],
+        )
+
+        execution_plan = compile_execution_plan(semantic_ast)
+
+        self.assertEqual([step.step_type for step in execution_plan.steps], ["edge", "edge", "edge", "edge", "operator"])
+        self.assertEqual(
+            [(step.source_node, step.target_node) for step in execution_plan.steps if step.step_type == "edge"],
+            [
+                ("movie_1", "director_1"),
+                ("director_1", "nationality_1"),
+                ("movie_2", "director_2"),
+                ("director_2", "nationality_2"),
+            ],
+        )
+        self.assertEqual(execution_plan.steps[-1].inputs, ["X2", "X4"])
+
+    def test_subquestion_generation_rejects_expanded_bound_source_and_bad_operator_step(self) -> None:
+        semantic_ast = SemanticASTResult(
+            status="ok",
+            primary_operator=SemanticASTPrimaryOperator(
+                operator="COMPARE_SAME",
+                inputs=["nationality_1"],
+                output="answer",
+                cue_text="same",
+            ),
+            nodes=[
+                SemanticASTNode(id="movie_1", label="Ten9Eight: Shoot For The Moon", kind="entity"),
+                SemanticASTNode(id="director_1", label="director", kind="type_variable"),
+                SemanticASTNode(id="nationality_1", label="nationality", kind="type_variable"),
+                SemanticASTNode(id="operator_compare_same", label="COMPARE_SAME", kind="operator"),
+            ],
+            edges=[
+                SemanticASTEdge(source="movie_1", target="director_1", edge_type="attribute", relation_hint="director of film"),
+                SemanticASTEdge(source="director_1", target="nationality_1", edge_type="attribute", relation_hint="nationality of director"),
+                SemanticASTEdge(source="nationality_1", target="operator_compare_same", edge_type="operator", relation_hint="COMPARE_SAME"),
+            ],
+        )
+
+        subquestions = SubquestionGenerator(BadBindingFakeLLM()).generate(
+            "Do the directors of Ten9Eight: Shoot For The Moon and Sabotage (1936 Film) have the same nationality?",
+            semantic_ast,
+        )
+
+        self.assertEqual(subquestions[0].question, "Who is the director of Ten9Eight: Shoot For The Moon?")
+        self.assertEqual(subquestions[1].question, "What is the nationality of X1?")
+        self.assertEqual(subquestions[1].source, "fallback_template")
+        self.assertEqual(subquestions[2].question, "Are X2 the same?")
+        self.assertEqual(subquestions[2].source, "fallback_template")
 
 
 if __name__ == "__main__":

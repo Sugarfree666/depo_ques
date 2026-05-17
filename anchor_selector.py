@@ -40,6 +40,18 @@ ILLEGAL_ANCHOR_TEXT = {
     "youngest",
     "younger",
 }
+RELATION_ANCHOR_TEXT = {
+    "develop",
+    "developed",
+    "develops",
+    "graduate",
+    "graduated",
+    "graduates",
+    "located",
+    "share",
+    "shared",
+    "shares",
+}
 
 ALLOWED_ANCHOR_KINDS = {"entity", "type_variable"}
 
@@ -70,7 +82,6 @@ class AnchorSelector:
                         restored_graph_node_candidates=[
                             candidate.to_llm_view()
                             for candidate in restored_graph_node_candidates
-                            if _candidate_visible_to_llm(candidate)
                         ],
                         restored_dependency_tokens=restored_dependency_tokens(
                             dependency_parse,
@@ -150,8 +161,7 @@ class AnchorSelector:
 
 
 def _candidate_visible_to_llm(candidate: RestoredGraphNodeCandidate) -> bool:
-    if candidate.kind_hint == "context":
-        return False
+    del candidate
     return True
 
 
@@ -227,7 +237,14 @@ def _is_illegal_anchor(candidate: RestoredGraphNodeCandidate, text: str) -> bool
     normalized = _normalize(text)
     if normalized in ILLEGAL_ANCHOR_TEXT:
         return True
+    if normalized in RELATION_ANCHOR_TEXT:
+        return True
     if candidate.kind_hint == "cue_candidate":
+        return True
+    if candidate.kind_hint == "context":
+        return True
+    pos = (candidate.pos or "").upper()
+    if pos.startswith("VB") or pos in {"AUX", "VERB"}:
         return True
     return False
 

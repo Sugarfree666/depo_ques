@@ -239,15 +239,9 @@ def print_result(index: int, record: QuestionRecord, result: dict[str, Any], deb
     print()
 
     print("[5. Restored Graph Node Candidates]")
-    printed_candidate_texts: set[str] = set()
     for candidate in restored_graph_node_candidates:
-        if candidate.kind_hint == "context":
-            continue
-        if candidate.display_text in printed_candidate_texts:
-            continue
-        printed_candidate_texts.add(candidate.display_text)
         print(f"  - {candidate.display_text}")
-    if not printed_candidate_texts:
+    if not restored_graph_node_candidates:
         print("  (none)")
     print()
 

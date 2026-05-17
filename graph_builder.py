@@ -43,6 +43,7 @@ MEDIUM_WEIGHT_RELATIONS = {"nmod:of", "acl:relcl", "aux:pass"}
 HIGH_WEIGHT_BASES = {"cc", "det", "punct", "dep"}
 COORDINATION_WEIGHT_BASES = {"conj"}
 DEFAULT_RELATION_WEIGHT = 3
+COORDINATION_RELATION_WEIGHT = 10
 INFINITE_RELATION_WEIGHT = math.inf
 
 ANCHOR_CUE_WORDS = {
@@ -677,7 +678,7 @@ def relation_weight(relation: str) -> float:
     if normalized in MEDIUM_WEIGHT_RELATIONS or base in MEDIUM_WEIGHT_BASES:
         return 3
     if base in COORDINATION_WEIGHT_BASES:
-        return INFINITE_RELATION_WEIGHT
+        return COORDINATION_RELATION_WEIGHT
     if base in HIGH_WEIGHT_BASES:
         return 5
     return DEFAULT_RELATION_WEIGHT

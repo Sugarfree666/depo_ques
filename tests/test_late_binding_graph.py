@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import re
 import unittest
 
@@ -84,7 +83,7 @@ class LateBindingGraphTests(unittest.TestCase):
         self.assertEqual(relation_weight("nmod:of"), 3)
         self.assertEqual(relation_weight("obl:in"), 3)
         self.assertEqual(relation_weight("compound"), 3)
-        self.assertTrue(math.isinf(relation_weight("conj:and")))
+        self.assertEqual(relation_weight("conj:and"), 10)
         self.assertEqual(relation_weight("det"), 5)
         self.assertEqual(relation_weight("unknown_relation"), 3)
 
