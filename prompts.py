@@ -3,19 +3,278 @@ from __future__ import annotations
 import json
 
 ALLOWED_OPERATORS = [
+    "NONE",
     "COMPARE_SAME",
     "COMPARE_DIFF",
-    "INTERSECTION",
-    "UNION",
-    "DIFFERENCE",
     "COMPARE_GREATER",
     "COMPARE_LESS",
     "ARGMAX",
     "ARGMIN",
+    "INTERSECTION",
+    "UNION",
+    "DIFFERENCE",
     "LOGICAL_AND",
     "LOGICAL_OR",
-    "NONE",
 ]
+
+MASK_SPAN_EXTRACTION_SYSTEM = """
+You are implementing DEPO Step 1: selective complex-span masking only.
+Your job is to identify only spans that should be replaced by a POS-hint placeholder before CoreNLP parsing.
+Do not perform anchor extraction.
+Do not output selected anchors, implicit variables, operators, relations, AST nodes, or subquestions.
+Mask only complex named entities and multi-word type/function noun phrases that are likely to be fragmented by a dependency parser.
+Keep simple type variables such as director, CEO, university, city, nationality, age, population, country, and actor unmasked unless they are part of a larger multi-word phrase.
+Return valid JSON only.
+""".strip()
+
+
+def build_mask_span_extraction_prompt(question: str) -> str:
+    schema = {
+        "mask_spans": [
+            {
+                "text": "Ten9Eight: Shoot For The Moon",
+                "start_char": 20,
+                "end_char": 51,
+                "kind_hint": "entity",
+                "semantic_type_hint": "Film",
+                "reason": "complex title with digit and colon",
+            }
+        ]
+    }
+    return f"""
+Identify only spans that should be masked before CoreNLP parsing.
+
+Mask:
+- complex named entities with colon, parentheses, quotes, digits, or special punctuation
+- continuous multi-word named entities such as New York City or University of Southern California
+- multi-word type variables or functional noun phrases such as distribution network, artificial intelligence company, mixed-use space, or local food distribution network
+
+Do not mask simple one-word type variables by default:
+director, CEO, university, city, nationality, age, population, country, actor.
+
+Forbidden outputs:
+- selected anchors
+- implicit type variables
+- operators
+- final AST
+- subquestions
+- decomposition of coordination
+
+Use exact original question character offsets, start inclusive and end exclusive.
+
+Output JSON with exactly this shape:
+{json.dumps(schema, ensure_ascii=False, indent=2)}
+
+Question:
+{question}
+""".strip()
+
+
+ANCHOR_SELECTION_SYSTEM = """
+You are implementing DEPO Step 4: explicit anchor selection.
+You must select anchors only from the provided restored graph node candidates.
+The candidate text already shows the original question text; do not ask for or use placeholder/original mixed labels.
+Allowed anchor kinds are exactly: entity, type_variable.
+Do not select implicit_type_variable, operator, relation, cue, comparative cue, superlative cue, coordination cue, or logical cue.
+Do not select words such as same, different, older, younger, larger, smaller, largest, highest, first, last, before, after, and, or, both, either.
+Return valid JSON only.
+""".strip()
+
+
+def build_anchor_selection_prompt(
+    original_question: str,
+    masked_question: str,
+    restored_graph_node_candidates: list[dict[str, object]],
+    restored_dependency_tokens: list[dict[str, object]],
+    restored_dependency_edges: list[dict[str, object]],
+) -> str:
+    schema = {
+        "selected_anchors": [
+            {
+                "node_id": "8",
+                "anchor_kind": "entity",
+                "text": "Ten9Eight: Shoot For The Moon",
+                "reason": "Film entity explicitly mentioned in the question",
+            },
+            {
+                "node_id": "13",
+                "anchor_kind": "type_variable",
+                "text": "nationality",
+                "reason": "Explicit attribute being compared",
+            },
+        ]
+    }
+    return f"""
+Select explicit anchors for the question from restored graph node candidates.
+
+Original question:
+{original_question}
+
+Masked question used only for CoreNLP alignment:
+{masked_question}
+
+Restored graph node candidates:
+{json.dumps(restored_graph_node_candidates, ensure_ascii=False, indent=2)}
+
+Restored dependency tokens:
+{json.dumps(restored_dependency_tokens, ensure_ascii=False, indent=2)}
+
+Restored dependency edges:
+{json.dumps(restored_dependency_edges, ensure_ascii=False, indent=2)}
+
+Rules:
+- Output node_id values from the candidate list.
+- Select only explicit entity anchors and explicit type_variable anchors.
+- Do not select implicit variables. For "Which actor is older?", select actor only; do not create age here.
+- Do not select operators or cues. For "same nationality", select nationality, not same.
+- Do not select relation words, comparative/superlative words, or coordination words.
+- If a candidate is a restored placeholder, use its restored text exactly in the text field.
+
+Output JSON with exactly this shape:
+{json.dumps(schema, ensure_ascii=False, indent=2)}
+""".strip()
+
+
+SEMANTIC_AST_OPTIMIZATION_SYSTEM = """
+You are implementing DEPO Step 6: semantic AST optimization.
+The input subgraph is an undirected syntactic/evidence subgraph with restored node text for display.
+Use the original question and selected explicit anchors to build a directed semantic AST suitable for one-hop atomic subquestion generation.
+This is the only step that may create implicit type variables and choose a primary operator.
+Choose exactly one primary_operator from the allowed operator set. Use NONE when there is no comparison, superlative, set, or logical cue.
+Do not invent entities that are not present in the original question or mask mapping.
+Do not generate subquestions.
+Return valid JSON only.
+""".strip()
+
+
+def build_semantic_ast_optimization_prompt(
+    original_question: str,
+    replacement: dict[str, object],
+    selected_anchors: list[dict[str, object]],
+    restored_anchor_connected_subgraph: dict[str, object],
+    allowed_operators: list[str],
+) -> str:
+    schema = {
+        "status": "ok",
+        "primary_operator": {
+            "operator": "COMPARE_SAME",
+            "cue_text": "same",
+            "inputs": ["nationality_1", "nationality_2"],
+            "output": "answer",
+            "explanation": "The question asks whether two nationalities are the same.",
+        },
+        "nodes": [
+            {
+                "id": "movie_1",
+                "label": "Ten9Eight: Shoot For The Moon",
+                "kind": "entity",
+                "semantic_type": "Film",
+                "source": "selected_anchor",
+                "source_graph_nodes": ["8"],
+                "source_token_indices": [8],
+                "grounding_text": "Ten9Eight: Shoot For The Moon",
+                "cue_text": "",
+            }
+        ],
+        "edges": [
+            {
+                "source": "movie_1",
+                "target": "director_1",
+                "edge_type": "attribute",
+                "relation_hint": "director of film",
+                "support_path": ["Ten9Eight: Shoot For The Moon", "film", "director"],
+                "support_dependency_relations": ["appos", "nmod:of"],
+            }
+        ],
+    }
+    return f"""
+Optimize the restored anchor connected subgraph into a directed semantic AST.
+
+Original question:
+{original_question}
+
+Mask restore information:
+{json.dumps(replacement, ensure_ascii=False, indent=2)}
+
+Selected explicit anchors:
+{json.dumps(selected_anchors, ensure_ascii=False, indent=2)}
+
+Restored anchor connected subgraph:
+{json.dumps(restored_anchor_connected_subgraph, ensure_ascii=False, indent=2)}
+
+Allowed primary operators:
+{json.dumps(allowed_operators, ensure_ascii=False)}
+
+Rules:
+- Choose exactly one primary_operator.operator from the allowed set.
+- Use NONE when no operator cue is present.
+- Operator choice must be grounded in the original question cue, e.g. same -> COMPARE_SAME, different -> COMPARE_DIFF, older -> COMPARE_GREATER on age, largest/highest/most -> ARGMAX.
+- You may add implicit type variables only when grounded by a cue in the original question.
+- Implicit variables must include cue_text and grounding_text.
+- You may split parallel branches and copy shared variables, e.g. nationality -> nationality_1 and nationality_2.
+- Convert the undirected evidence graph into directed semantic edges.
+- Keep selected anchors unless you provide an explicit reason in the node/edge choices.
+- Do not create entities that are absent from selected anchors or mask mappings.
+- Do not generate atomic subquestions.
+
+Output JSON with exactly this shape:
+{json.dumps(schema, ensure_ascii=False, indent=2)}
+""".strip()
+
+
+ATOMIC_SUBQUESTION_GENERATION_SYSTEM = """
+You are implementing DEPO Step 8: LLM-based atomic subquestion generation.
+Generate exactly one atomic subquestion for the provided one-hop semantic AST edge, or exactly one operator step for the provided primary operator.
+Use the original question and semantic AST context, but do not combine multiple AST edges into a multi-hop question.
+For ordinary attribute edges, do not include operator cue words such as same, older, largest, before, or after.
+Return valid JSON only.
+""".strip()
+
+
+def build_atomic_subquestion_generation_prompt(
+    original_question: str,
+    semantic_ast: dict[str, object],
+    current_edge: dict[str, object],
+    source_node: dict[str, object] | None,
+    target_node: dict[str, object] | None,
+    primary_operator: dict[str, object],
+) -> str:
+    schema = {
+        "question": "Who is the director of Ten9Eight: Shoot For The Moon?",
+        "answer_variable": "X1",
+        "explanation": "This asks only for the target node of the one-hop edge.",
+    }
+    return f"""
+Generate one atomic subquestion for the current semantic item.
+
+Original question:
+{original_question}
+
+Final semantic AST:
+{json.dumps(semantic_ast, ensure_ascii=False, indent=2)}
+
+Current one-hop edge or operator step:
+{json.dumps(current_edge, ensure_ascii=False, indent=2)}
+
+Source node:
+{json.dumps(source_node, ensure_ascii=False, indent=2)}
+
+Target node:
+{json.dumps(target_node, ensure_ascii=False, indent=2)}
+
+Primary operator:
+{json.dumps(primary_operator, ensure_ascii=False, indent=2)}
+
+Rules:
+- For a directed one-hop edge, generate exactly one question for that edge only.
+- Do not merge this edge with another edge.
+- Do not include same/older/largest/comparative/superlative cue words in ordinary attribute questions.
+- For an implicit variable edge such as actor -> age, ask a normal attribute question such as "What is the age of the actor?"
+- For an operator step, generate a question or structured step that applies the operator to its inputs.
+
+Output JSON with exactly this shape:
+{json.dumps(schema, ensure_ascii=False, indent=2)}
+""".strip()
 
 GLOBAL_METHOD_GUARD = """
 You are implementing the DEPO method from depo.md.

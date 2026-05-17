@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any
 
-from models import ExtractedNode, ExtractionResult, PlaceholderReplacement
+from models import ExtractedNode, ExtractionResult, MaskMapping, MaskReplacement, MaskSpan, MaskSpanResult, PlaceholderReplacement
 
 COMPLEX_ENTITY_PATTERN = re.compile(r"[:()\[\]{}\"'\u201c\u201d\u2018\u2019,\-\u2013\u2014]")
 LONG_NAMED_ENTITY_TYPES = {
@@ -144,8 +144,11 @@ class _MaskCandidate:
 
 
 def selective_entity_masking(
-    original_question: str,
-    extracted_nodes: ExtractionResult | dict[str, Any],
+    original_question: str | None = None,
+    extracted_nodes: ExtractionResult | MaskSpanResult | dict[str, Any] | None = None,
+    *,
+    question: str | None = None,
+    mask_spans: MaskSpanResult | None = None,
 ) -> PlaceholderReplacement:
     """Mask complex noun phrases while preserving the syntactic scaffold.
 
@@ -153,6 +156,16 @@ def selective_entity_masking(
     noun phrases use POS-hinting anchor ids such as CompanyA/MovieA, while simple
     entity/type-variable anchors stay unmasked with shifted character spans.
     """
+
+    if original_question is None:
+        original_question = question
+    if extracted_nodes is None:
+        extracted_nodes = mask_spans
+    if original_question is None or extracted_nodes is None:
+        raise TypeError("selective_entity_masking requires a question and mask spans/extracted nodes.")
+
+    if isinstance(extracted_nodes, MaskSpanResult):
+        return _selective_span_masking(original_question, extracted_nodes)
 
     extraction = _coerce_extraction(original_question, extracted_nodes)
     candidates = _select_mask_candidates(original_question, extraction)
@@ -201,11 +214,133 @@ def selective_entity_masking(
     return PlaceholderReplacement(
         question=masked_question,
         mapping=mapping,
+        original_question=original_question,
         replacements=replacements,
         mask_mapping=mask_mapping,
+        mask_mappings=_mask_mappings_from_legacy(mask_mapping),
         preserved_type_variables=preserved_type_variables,
         anchor_extraction=anchor_extraction,
     )
+
+
+def _selective_span_masking(
+    original_question: str,
+    mask_span_result: MaskSpanResult,
+) -> MaskReplacement:
+    extraction = _extraction_from_mask_spans(original_question, mask_span_result.mask_spans)
+    candidates: list[_MaskCandidate] = []
+    nodes = extraction.nodes
+    for node in nodes:
+        if node.start is None or node.end is None:
+            continue
+        candidates.append(
+            _MaskCandidate(
+                node=node,
+                start=node.start,
+                end=node.end,
+                original_text=original_question[node.start : node.end],
+            )
+        )
+    candidates = _remove_overlapping_candidates(candidates)
+    _assign_entity_masks(candidates, extraction)
+    _compute_masked_spans(candidates)
+
+    masked_question = original_question
+    for candidate in sorted(candidates, key=lambda item: item.start, reverse=True):
+        masked_question = (
+            masked_question[: candidate.start] + candidate.mask + masked_question[candidate.end :]
+        )
+
+    mask_mapping = _build_mask_mapping(candidates)
+    replacements = [
+        {
+            "start": candidate.start,
+            "end": candidate.end,
+            "masked_start": candidate.masked_start,
+            "masked_end": candidate.masked_end,
+            "placeholder": candidate.mask,
+            "original_placeholder": candidate.node.placeholder,
+            "text": candidate.original_text,
+            "semantic_type": candidate.node.semantic_type,
+            "kind": candidate.node.kind,
+        }
+        for candidate in sorted(candidates, key=lambda item: item.start)
+    ]
+    mapping = {
+        candidate.mask: candidate.original_text
+        for candidate in sorted(candidates, key=lambda item: item.start)
+    }
+    return MaskReplacement(
+        question=masked_question,
+        mapping=mapping,
+        original_question=original_question,
+        replacements=replacements,
+        mask_mapping=mask_mapping,
+        mask_mappings=_mask_mappings_from_legacy(mask_mapping),
+        preserved_type_variables=[],
+        anchor_extraction=None,
+    )
+
+
+def _extraction_from_mask_spans(question: str, spans: list[MaskSpan]) -> ExtractionResult:
+    entities: list[ExtractedNode] = []
+    type_variables: list[ExtractedNode] = []
+    for index, span in enumerate(spans, start=1):
+        start, end = _resolve_node_span(
+            question,
+            span.text,
+            span.start_char,
+            span.end_char,
+            occurrence=1,
+        )
+        if start is None or end is None:
+            continue
+        kind = "type_variable" if span.kind_hint == "type_variable" else "entity"
+        semantic_type = span.semantic_type_hint or ("Variable" if kind == "type_variable" else "Entity")
+        node = ExtractedNode(
+            placeholder=_fallback_placeholder(semantic_type, kind, index),
+            text=question[start:end],
+            kind=kind,
+            semantic_type=semantic_type,
+            start=start,
+            end=end,
+            occurrence=1,
+        )
+        if kind == "type_variable":
+            type_variables.append(node)
+        else:
+            entities.append(node)
+    return ExtractionResult(entities=entities, type_variables=type_variables)
+
+
+def _mask_mappings_from_legacy(mask_mapping: dict[str, dict[str, Any]]) -> list[MaskMapping]:
+    mappings: list[MaskMapping] = []
+    for placeholder, info in mask_mapping.items():
+        span = info.get("span") or {}
+        masked_span = info.get("masked_span") or {}
+        original_char_span = _span_list(span)
+        masked_char_span = _span_list(masked_span)
+        mappings.append(
+            MaskMapping(
+                placeholder=placeholder,
+                original_text=str(info.get("text", "")),
+                kind_hint=str(info.get("kind", "entity")),
+                semantic_type_hint=str(info.get("semantic_type", info.get("type", ""))) or None,
+                original_char_span=original_char_span,
+                masked_char_span=masked_char_span,
+            )
+        )
+    return mappings
+
+
+def _span_list(value: Any) -> list[int]:
+    if not isinstance(value, dict):
+        return []
+    start = value.get("start")
+    end = value.get("end")
+    if start is None or end is None:
+        return []
+    return [int(start), int(end)]
 
 
 def replace_with_placeholders(question: str, extraction: ExtractionResult) -> PlaceholderReplacement:

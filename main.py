@@ -6,19 +6,29 @@ import sys
 from typing import TYPE_CHECKING, Any
 
 from io_utils import read_questions
-from models import ASTResult, AtomicSubquestion, ExtractionResult, PlaceholderReplacement, QuestionRecord
+from models import (
+    AnchorSelectionResult,
+    AtomicSubquestion,
+    MaskReplacement,
+    MaskSpanResult,
+    QuestionRecord,
+    RestoredAnchorConnectedSubgraph,
+    RestoredGraphNodeCandidate,
+    SemanticASTResult,
+)
 
 if TYPE_CHECKING:
-    from ast_builder import ASTBuilder
+    from anchor_selector import AnchorSelector
+    from ast_builder import SemanticASTOptimizer
     from corenlp_parser import CoreNLPParser
-    from entity_extractor import EntityExtractor
     from graph_builder import GraphBuilder
+    from mask_span_extractor import MaskSpanExtractor
     from subquestion_generator import SubquestionGenerator
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="DEPO decomposition from selective masking through weighted dependency graphs, AST, and one-hop subquestions."
+        description="DEPO decomposition with mask-only parsing, restored anchor selection, semantic AST, and one-hop subquestions."
     )
     parser.add_argument("--question", help="Run one manually supplied question instead of questions.json.")
     parser.add_argument("--questions-file", default="questions.json", help="Path to questions.json.")
@@ -40,7 +50,7 @@ def parse_args() -> argparse.Namespace:
         default=60000,
         help="CoreNLP annotation timeout in milliseconds.",
     )
-    parser.add_argument("--debug", action="store_true", help="Print additional intermediate structures.")
+    parser.add_argument("--debug", action="store_true", help="Print detailed intermediate structures.")
     return parser.parse_args()
 
 
@@ -55,17 +65,19 @@ def main() -> int:
     records = [QuestionRecord(question=args.question)] if args.question else read_questions(args.questions_file)
 
     try:
-        from ast_builder import ASTBuilder
+        from anchor_selector import AnchorSelector
+        from ast_builder import SemanticASTOptimizer
         from corenlp_parser import CoreNLPConnectionError, CoreNLPParser
-        from entity_extractor import EntityExtractor
-        from graph_builder import AnchorGraphError, GraphBuilder
+        from graph_builder import GraphBuilder
         from llm_client import LLMClient
+        from mask_span_extractor import MaskSpanExtractor
         from subquestion_generator import SubquestionGenerator
 
         llm_client = LLMClient(api_key=api_key, base_url=base_url, model="gpt-4o-mini")
-        extractor = EntityExtractor(llm_client)
+        mask_span_extractor = MaskSpanExtractor(llm_client)
         graph_builder = GraphBuilder()
-        ast_builder = ASTBuilder(llm_client)
+        anchor_selector = AnchorSelector(llm_client)
+        semantic_ast_optimizer = SemanticASTOptimizer(llm_client)
         subquestion_generator = SubquestionGenerator(llm_client)
 
         with CoreNLPParser(
@@ -78,10 +90,11 @@ def main() -> int:
                 result = run_pipeline(
                     record=record,
                     index=index,
-                    extractor=extractor,
+                    mask_span_extractor=mask_span_extractor,
                     parser=parser,
                     graph_builder=graph_builder,
-                    ast_builder=ast_builder,
+                    anchor_selector=anchor_selector,
+                    semantic_ast_optimizer=semantic_ast_optimizer,
                     subquestion_generator=subquestion_generator,
                     debug=args.debug,
                 )
@@ -89,7 +102,7 @@ def main() -> int:
     except ModuleNotFoundError as exc:
         print(f"Missing dependency: {exc.name}. Run: pip install -r requirements.txt", file=sys.stderr)
         return 2
-    except (CoreNLPConnectionError, AnchorGraphError, RuntimeError, ValueError) as exc:
+    except (CoreNLPConnectionError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
@@ -99,42 +112,85 @@ def main() -> int:
 def run_pipeline(
     record: QuestionRecord,
     index: int,
-    extractor: "EntityExtractor",
+    mask_span_extractor: "MaskSpanExtractor",
     parser: "CoreNLPParser",
     graph_builder: "GraphBuilder",
-    ast_builder: "ASTBuilder",
+    anchor_selector: "AnchorSelector",
+    semantic_ast_optimizer: "SemanticASTOptimizer",
     subquestion_generator: "SubquestionGenerator",
     debug: bool = False,
 ) -> dict[str, Any]:
+    del index, debug
     from placeholder import selective_entity_masking
 
-    extraction = extractor.extract(record.question)
-    replacement = selective_entity_masking(record.question, extraction)
-    anchor_extraction = replacement.anchor_extraction or extraction
+    mask_spans = mask_span_extractor.extract(record.question)
+    replacement = selective_entity_masking(
+        original_question=record.question,
+        extracted_nodes=mask_spans,
+    )
     dependency_parse = parser.parse(replacement.masked_question)
-    anchor_graph = graph_builder.build_anchor_graph(dependency_parse, anchor_extraction)
-    ast = ast_builder.build(record.question, anchor_extraction, replacement, anchor_graph)
-    subquestions = subquestion_generator.generate(record.question, ast, anchor_extraction)
+    weighted_graph = graph_builder.build_weighted_dependency_graph(dependency_parse)
+    graph_node_candidates = graph_builder.build_graph_node_candidates(
+        dependency_parse=dependency_parse,
+        replacement=replacement,
+    )
+    restored_graph_node_candidates = graph_builder.restore_graph_node_candidates(
+        graph_node_candidates=graph_node_candidates,
+        replacement=replacement,
+    )
+    anchor_selection = anchor_selector.select(
+        original_question=record.question,
+        masked_question=replacement.masked_question,
+        replacement=replacement,
+        dependency_parse=dependency_parse,
+        weighted_graph=weighted_graph,
+        restored_graph_node_candidates=restored_graph_node_candidates,
+    )
+    anchor_connected_subgraph = graph_builder.build_anchor_connected_subgraph(
+        weighted_graph=weighted_graph,
+        selected_anchors=anchor_selection.selected_anchors,
+        graph_node_candidates=graph_node_candidates,
+    )
+    restored_anchor_connected_subgraph = graph_builder.restore_anchor_connected_subgraph(
+        anchor_connected_subgraph=anchor_connected_subgraph,
+        replacement=replacement,
+    )
+    semantic_ast = semantic_ast_optimizer.optimize(
+        original_question=record.question,
+        replacement=replacement,
+        selected_anchors=anchor_selection.selected_anchors,
+        restored_anchor_connected_subgraph=restored_anchor_connected_subgraph,
+    )
+    subquestions = subquestion_generator.generate(
+        original_question=record.question,
+        ast=semantic_ast,
+    )
     return {
-        "extraction": extraction,
-        "anchor_extraction": anchor_extraction,
+        "mask_spans": mask_spans,
         "replacement": replacement,
         "dependency_parse": dependency_parse,
-        "anchor_graph": anchor_graph,
-        "ast": ast,
+        "weighted_graph": weighted_graph,
+        "graph_node_candidates": graph_node_candidates,
+        "restored_graph_node_candidates": restored_graph_node_candidates,
+        "anchor_selection": anchor_selection,
+        "anchor_connected_subgraph": anchor_connected_subgraph,
+        "restored_anchor_connected_subgraph": restored_anchor_connected_subgraph,
+        "semantic_ast": semantic_ast,
         "subquestions": subquestions,
     }
 
 
 def print_result(index: int, record: QuestionRecord, result: dict[str, Any], debug: bool = False) -> None:
-    from graph_builder import format_graph_lines, format_weighted_graph_edges
+    from graph_builder import format_weighted_graph_edges
 
-    extraction: ExtractionResult = result["extraction"]
-    anchor_extraction: ExtractionResult = result.get("anchor_extraction", extraction)
-    replacement: PlaceholderReplacement = result["replacement"]
+    mask_spans: MaskSpanResult = result["mask_spans"]
+    replacement: MaskReplacement = result["replacement"]
     dependency_parse = result["dependency_parse"]
-    anchor_graph = result["anchor_graph"]
-    ast: ASTResult = result["ast"]
+    weighted_graph = result["weighted_graph"]
+    restored_graph_node_candidates: list[RestoredGraphNodeCandidate] = result["restored_graph_node_candidates"]
+    anchor_selection: AnchorSelectionResult = result["anchor_selection"]
+    restored_anchor_connected_subgraph: RestoredAnchorConnectedSubgraph = result["restored_anchor_connected_subgraph"]
+    semantic_ast: SemanticASTResult = result["semantic_ast"]
     subquestions: list[AtomicSubquestion] = result["subquestions"]
 
     separator = "=" * 60
@@ -150,46 +206,31 @@ def print_result(index: int, record: QuestionRecord, result: dict[str, Any], deb
     print(record.question)
     print()
 
-    print("[1. Entities and Type Variables]")
-    print("Entities:")
-    _print_nodes(extraction.entities)
-    print()
-    print("Type Variables:")
-    _print_nodes(extraction.type_variables)
+    print("[1. Mask Spans]")
+    if replacement.mask_mappings:
+        for mapping in replacement.mask_mappings:
+            print(f"  - {mapping.original_text} -> {mapping.placeholder}")
+    else:
+        print("  (none)")
+    if debug:
+        _print_warnings(mask_spans.warnings)
     print()
 
     print("[2. Selective Masked Question]")
-    print(replacement.question)
-    print()
-    print("Mask Mapping:")
-    if replacement.mask_mapping:
-        for placeholder, info in replacement.mask_mapping.items():
-            print(f"  - {placeholder}: {info.get('text')} ({info.get('semantic_type')})")
-    else:
-        print("  (no complex entities masked)")
-    print()
-    print("Preserved Type Variables:")
-    if replacement.preserved_type_variables:
-        for item in replacement.preserved_type_variables:
-            print(f"  - {item.get('placeholder')}: {item.get('text')}")
-    else:
-        print("  (none)")
+    print(replacement.masked_question)
     print()
 
-    print("[3. Dependency Graph: Enhanced++]")
+    print("[3. CoreNLP Dependency Parse]")
     print("Edges:")
-    edge_lines = _format_dependency_edges(dependency_parse)
-    if edge_lines:
-        for line in edge_lines:
-            print(line)
+    if dependency_parse.edges:
+        for edge in dependency_parse.edges:
+            print(f"  - {edge.display()}")
     else:
         print("  (no dependency edges)")
     print()
 
     print("[4. Weighted Undirected Dependency Graph]")
-    print("Edges:")
-    weighted_graph = anchor_graph.weighted_graph
-    weighted_lines = format_weighted_graph_edges(weighted_graph) if weighted_graph is not None else []
+    weighted_lines = format_weighted_graph_edges(weighted_graph)
     if weighted_lines:
         for line in weighted_lines:
             print(line)
@@ -197,79 +238,99 @@ def print_result(index: int, record: QuestionRecord, result: dict[str, Any], deb
         print("  (no weighted edges)")
     print()
 
-    print("[5. Anchor Shortest-Path Subgraph]")
+    print("[5. Restored Graph Node Candidates]")
+    printed_candidate_texts: set[str] = set()
+    for candidate in restored_graph_node_candidates:
+        if candidate.kind_hint == "context":
+            continue
+        if candidate.display_text in printed_candidate_texts:
+            continue
+        printed_candidate_texts.add(candidate.display_text)
+        print(f"  - {candidate.display_text}")
+    if not printed_candidate_texts:
+        print("  (none)")
+    print()
+
+    print("[6. Selected Explicit Anchors]")
+    if anchor_selection.selected_anchors:
+        for anchor in anchor_selection.selected_anchors:
+            print(f"  - {anchor.display_text}")
+    else:
+        print("  (none)")
+    if debug:
+        _print_warnings(anchor_selection.warnings)
+    print()
+
+    print("[7. Anchor Connected Subgraph]")
     print("Edges:")
-    anchor_subgraph = anchor_graph.anchor_subgraph
-    subgraph_lines = format_weighted_graph_edges(anchor_subgraph) if anchor_subgraph is not None else []
-    if subgraph_lines:
-        for line in subgraph_lines:
+    subgraph_edge_lines = _format_restored_subgraph_edges(restored_anchor_connected_subgraph)
+    if subgraph_edge_lines:
+        for line in subgraph_edge_lines:
             print(line)
     else:
-        print("  (no anchor subgraph edges)")
+        print("  (no subgraph edges)")
     print()
 
-    print("[6. Anchor-Only Semantic Graph]")
-    entity_nodes = [node.placeholder for node in anchor_extraction.entities]
-    for line in format_graph_lines(
-        anchor_graph.graph,
-        label_func=_semantic_label(anchor_extraction, replacement),
-        entity_nodes=entity_nodes,
-    ):
-        print(line)
+    print("[8. Final Semantic AST]")
+    _print_semantic_ast(semantic_ast)
+    if debug:
+        _print_warnings(semantic_ast.warnings)
     print()
 
-    print("[7. Final AST]")
-    operator_nodes = [
-        node for node, attrs in ast.graph.nodes(data=True) if attrs.get("kind") == "operator"
-    ]
-    for line in format_graph_lines(
-        ast.graph,
-        label_func=ast.display_label,
-        entity_nodes=entity_nodes,
-        operator_nodes=operator_nodes,
-    ):
-        print(line)
-    print()
-    print("Operators:")
-    if ast.operators:
-        for operator in ast.operators:
-            attach = f" (attach_to: {', '.join(operator.attach_to)})" if operator.attach_to else ""
-            print(f"  - {operator.operator}{attach}")
-    else:
-        print("  - NONE")
-    print()
-
-    print("[8. Atomic Subquestions]")
+    print("[9. Atomic Subquestions]")
     if not subquestions:
         print("  (no atomic subquestions generated)")
     for item in subquestions:
         print(f"  q{item.index}: {item.question}")
-        if item.answer_variable:
-            print(f"      answer: {item.answer_variable}")
-        print()
+    print()
 
 
-def _print_nodes(nodes: list[Any]) -> None:
-    if not nodes:
+def _format_restored_subgraph_edges(
+    restored_anchor_connected_subgraph: RestoredAnchorConnectedSubgraph,
+) -> list[str]:
+    lines: list[str] = []
+    for edge in restored_anchor_connected_subgraph.edges:
+        source = edge.get("source")
+        target = edge.get("target")
+        source_text = edge.get("source_text", source)
+        target_text = edge.get("target_text", target)
+        relation = edge.get("relation") or "|".join(edge.get("relations", []))
+        relation_text = relation or "related"
+        lines.append(f"  - {source_text}[{source}] --{relation_text}--> {target_text}[{target}]")
+    return lines
+
+
+def _print_semantic_ast(semantic_ast: SemanticASTResult) -> None:
+    operator = semantic_ast.primary_operator
+    if operator.operator != "NONE":
+        inputs = ", ".join(operator.inputs)
+        output = operator.output or "answer"
+        cue = f" cue={operator.cue_text}" if operator.cue_text else ""
+        print(f"Operator: {operator.operator}({inputs}) -> {output}{cue}")
+    else:
+        print("Operator: NONE")
+
+    print("Nodes:")
+    if semantic_ast.nodes:
+        for node in semantic_ast.nodes:
+            print(f"  - {node.id}: {node.label}")
+    else:
         print("  (none)")
+    print("Edges:")
+    if semantic_ast.edges:
+        for edge in semantic_ast.edges:
+            hint = f" ({edge.relation_hint})" if edge.relation_hint else ""
+            print(f"  - {edge.source} -> {edge.target}{hint}")
+    else:
+        print("  (none)")
+
+
+def _print_warnings(warnings: list[str]) -> None:
+    if not warnings:
         return
-    for node in nodes:
-        print(f"  - {node.placeholder}: {node.text}")
-
-
-def _format_dependency_edges(dependency_parse: Any) -> list[str]:
-    return [f"  - {edge.display()}" for edge in dependency_parse.edges]
-
-
-def _semantic_label(extraction: ExtractionResult, replacement: PlaceholderReplacement) -> Any:
-    labels = dict(replacement.mapping)
-    for node in extraction.nodes:
-        labels.setdefault(node.placeholder, node.text)
-
-    def label(node: str) -> str:
-        return labels.get(node, node)
-
-    return label
+    print("Warnings:")
+    for warning in warnings:
+        print(f"  - {warning}")
 
 
 if __name__ == "__main__":

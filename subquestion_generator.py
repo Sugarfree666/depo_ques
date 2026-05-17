@@ -6,8 +6,13 @@ from typing import TYPE_CHECKING
 
 import networkx as nx
 
-from models import ASTResult, AtomicSubquestion, ExtractionResult
-from prompts import ONE_HOP_SUBQUESTION_SYSTEM, build_one_hop_prompt
+from models import ASTResult, AtomicSubquestion, ExtractionResult, SemanticASTEdge, SemanticASTNode, SemanticASTResult
+from prompts import (
+    ATOMIC_SUBQUESTION_GENERATION_SYSTEM,
+    ONE_HOP_SUBQUESTION_SYSTEM,
+    build_atomic_subquestion_generation_prompt,
+    build_one_hop_prompt,
+)
 
 if TYPE_CHECKING:
     from llm_client import LLMClient
@@ -30,13 +35,126 @@ class SubquestionGenerator:
     def generate(
         self,
         original_question: str,
-        ast: ASTResult,
-        extraction: ExtractionResult,
+        ast: ASTResult | SemanticASTResult,
+        extraction: ExtractionResult | None = None,
     ) -> list[AtomicSubquestion]:
+        if isinstance(ast, SemanticASTResult):
+            return self._generate_from_semantic_ast(original_question, ast)
+        if extraction is None:
+            raise TypeError("Legacy ASTResult generation requires extraction.")
         operator_node = self._first_operator(ast)
         if operator_node:
             return self._generate_operator(original_question, ast, extraction, operator_node)
         return self._generate_general(original_question, ast, extraction)
+
+    def _generate_from_semantic_ast(
+        self,
+        original_question: str,
+        semantic_ast: SemanticASTResult,
+    ) -> list[AtomicSubquestion]:
+        node_by_id = semantic_ast.node_by_id()
+        questions: list[AtomicSubquestion] = []
+        for edge in semantic_ast.edges:
+            source_node = node_by_id.get(edge.source)
+            target_node = node_by_id.get(edge.target)
+            answer_variable = f"X{len(questions) + 1}"
+            question_text, source = self._semantic_edge_question(
+                original_question=original_question,
+                semantic_ast=semantic_ast,
+                edge=edge,
+                source_node=source_node,
+                target_node=target_node,
+                answer_variable=answer_variable,
+            )
+            questions.append(
+                AtomicSubquestion(
+                    index=len(questions) + 1,
+                    question=question_text,
+                    answer_variable=answer_variable,
+                    source_node=edge.source,
+                    target_node=edge.target,
+                    type="edge",
+                    source=source,
+                    ast_edge=edge.to_dict(),
+                )
+            )
+
+        if semantic_ast.primary_operator.operator != "NONE":
+            question_text, source = self._semantic_operator_question(
+                original_question=original_question,
+                semantic_ast=semantic_ast,
+            )
+            questions.append(
+                AtomicSubquestion(
+                    index=len(questions) + 1,
+                    question=question_text,
+                    answer_variable=None,
+                    operator=semantic_ast.primary_operator.operator,
+                    type="operator_step",
+                    source=source,
+                )
+            )
+        return questions
+
+    def _semantic_edge_question(
+        self,
+        original_question: str,
+        semantic_ast: SemanticASTResult,
+        edge: SemanticASTEdge,
+        source_node: SemanticASTNode | None,
+        target_node: SemanticASTNode | None,
+        answer_variable: str,
+    ) -> tuple[str, str]:
+        prompt = build_atomic_subquestion_generation_prompt(
+            original_question=original_question,
+            semantic_ast=semantic_ast.to_dict(),
+            current_edge={**edge.to_dict(), "answer_variable": answer_variable},
+            source_node=source_node.to_dict() if source_node else None,
+            target_node=target_node.to_dict() if target_node else None,
+            primary_operator=semantic_ast.primary_operator.to_dict(),
+        )
+        try:
+            payload = self.llm_client.chat_json(ATOMIC_SUBQUESTION_GENERATION_SYSTEM, prompt)
+            question = str(payload.get("question", "")).strip()
+            if not question:
+                raise ValueError("empty question")
+            if _contains_operator_cue(question) and edge.edge_type != "operator":
+                raise ValueError("ordinary edge question included operator cue")
+            return question, "llm"
+        except Exception:
+            return _fallback_semantic_edge_question(source_node, target_node), "fallback_template"
+
+    def _semantic_operator_question(
+        self,
+        original_question: str,
+        semantic_ast: SemanticASTResult,
+    ) -> tuple[str, str]:
+        operator = semantic_ast.primary_operator
+        current_edge = {
+            "type": "operator_step",
+            "operator": operator.operator,
+            "inputs": operator.inputs,
+            "output": operator.output,
+            "cue_text": operator.cue_text,
+        }
+        try:
+            payload = self.llm_client.chat_json(
+                ATOMIC_SUBQUESTION_GENERATION_SYSTEM,
+                build_atomic_subquestion_generation_prompt(
+                    original_question=original_question,
+                    semantic_ast=semantic_ast.to_dict(),
+                    current_edge=current_edge,
+                    source_node=None,
+                    target_node=None,
+                    primary_operator=operator.to_dict(),
+                ),
+            )
+            question = str(payload.get("question", "")).strip()
+            if not question:
+                raise ValueError("empty operator question")
+            return question, "llm"
+        except Exception:
+            return _operator_question(operator.operator, operator.inputs), "fallback_template"
 
     def _generate_general(
         self,
@@ -341,3 +459,33 @@ def _operator_question(operator: str, variables: list[str]) -> str:
     if operator == "LOGICAL_AND":
         return f"Do {' and '.join(variables)} all satisfy the condition?"
     return f"Apply {operator} to {', '.join(variables)}."
+
+
+def _contains_operator_cue(question: str) -> bool:
+    cues = {
+        "after",
+        "before",
+        "different",
+        "first",
+        "highest",
+        "larger",
+        "largest",
+        "older",
+        "same",
+        "smaller",
+        "youngest",
+        "younger",
+    }
+    words = set(re.findall(r"[A-Za-z]+", question.lower()))
+    return bool(words & cues)
+
+
+def _fallback_semantic_edge_question(
+    source_node: SemanticASTNode | None,
+    target_node: SemanticASTNode | None,
+) -> str:
+    source = source_node.label if source_node is not None else "the source"
+    target = target_node.label if target_node is not None else "the target"
+    if target_node is not None and target_node.kind in {"type_variable", "implicit_type_variable"}:
+        return f"What is the {target} of {source}?"
+    return f"What is the {target} related to {source}?"

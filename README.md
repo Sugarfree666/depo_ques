@@ -1,23 +1,79 @@
-# DEPO One-Hop Atomic Subquestion Decomposition
+# DEPO Question Decomposition Pipeline
 
-This project implements a DEPO-style decomposition pipeline for complex questions.
+This project implements a DEPO-style question decomposition pipeline where the
+dependency graph stays aligned to a selectively masked CoreNLP parse, while LLM
+anchor decisions are made on restored original question text.
 
-Current architecture:
+## Architecture
 
-1. extract entities and type variables with placeholders and character spans
-2. selectively mask complex noun phrases with POS-hinting placeholders such as `MovieA`, `CompanyA`, or `NetworkA`
-3. parse the masked natural-language question with Stanford CoreNLP Enhanced++
-4. convert the dependency graph to a weighted undirected graph
-5. build an anchor shortest-path subgraph with Dijkstra paths
-6. collapse to an anchor-only semantic graph
-7. choose AST operators with the LLM
-8. generate adjacent one-hop atomic subquestions with the LLM
+1. **Mask span extraction**
+   Step 1 is not full anchor extraction. It only finds complex named entities
+   and multi-word type/function noun phrases that should be masked to protect
+   CoreNLP parsing. It does not select anchors, infer implicit variables, choose
+   operators, split coordination, build an AST, or generate subquestions.
 
-Only selective masks are sent to CoreNLP. Simple anchors such as `director`,
-`CEO`, `university`, `city`, and `nationality` remain in the parsed question so
-the dependency parser keeps the natural syntactic scaffold.
+2. **Selective masking**
+   Complex spans are replaced with POS-hint placeholders such as `MovieA`,
+   `CompanyA`, `NetworkA`, or `TypeVarA`. Simple type variables such as
+   `director`, `CEO`, `university`, `city`, and `nationality` normally remain
+   in natural language.
 
-## Install
+3. **CoreNLP parse**
+   CoreNLP parses the masked question. The masked placeholders remain the
+   internal graph tokens so token indices and dependency node IDs stay stable.
+
+4. **Weighted undirected dependency graph**
+   The existing dependency relation weight scheme is preserved. Core relations
+   such as `nsubj`, `obj`, `iobj`, `ccomp`, and `xcomp` stay low weight;
+   modifiers such as `nmod`, `obl`, `amod`, and `compound` stay medium weight;
+   `det`, `punct`, and coordination penalties keep their previous behavior.
+
+5. **Restored graph node candidates**
+   Before LLM anchor selection, graph node candidates are restored for display.
+   The internal graph still contains placeholders like `MovieA`, but the LLM
+   sees candidate text directly from the original question:
+
+   ```json
+   {"node_id": "8", "text": "Ten9Eight: Shoot For The Moon"}
+   ```
+
+   It is never rendered as `MovieA [Ten9Eight: Shoot For The Moon]`.
+
+6. **Explicit anchor selection**
+   Step 4 asks the LLM to select only explicit anchors from restored graph node
+   candidates. Allowed anchor kinds are `entity` and `type_variable`. Operator
+   cues and implicit variables are forbidden here, so words such as `same`,
+   `older`, `largest`, `before`, `after`, `and`, and `or` are filtered by code
+   validation if the LLM returns them.
+
+7. **Anchor connected subgraph**
+   Step 5 uses the selected anchor `node_id` values to return to the masked
+   weighted graph and compute shortest-path evidence connecting anchors. This
+   subgraph is syntactic evidence, not the final AST.
+
+8. **Semantic AST optimization**
+   Step 6 is the only stage that may add implicit type variables and choose a
+   primary operator. The LLM receives the original question, selected anchors,
+   restored anchor connected subgraph, mask restore information, and the fixed
+   allowed operator set:
+
+   `NONE`, `COMPARE_SAME`, `COMPARE_DIFF`, `COMPARE_GREATER`,
+   `COMPARE_LESS`, `ARGMAX`, `ARGMIN`, `INTERSECTION`, `UNION`,
+   `DIFFERENCE`, `LOGICAL_AND`, `LOGICAL_OR`.
+
+   Examples: `same` maps to `COMPARE_SAME`; `older` can create an implicit
+   `age` variable and choose `COMPARE_GREATER`; `largest population` chooses
+   `ARGMAX`.
+
+9. **LLM atomic subquestion generation**
+   Step 8 generates atomic subquestions from the final semantic AST. The LLM is
+   called once per directed one-hop AST edge, and an operator step is generated
+   separately from `primary_operator`. One atomic subquestion must correspond to
+   exactly one AST edge; multi-hop fusion is not allowed.
+
+## Run
+
+Install dependencies:
 
 ```powershell
 pip install -r requirements.txt
@@ -28,14 +84,6 @@ Install Stanford CoreNLP for Stanza once:
 ```powershell
 python -c "import stanza; stanza.install_corenlp()"
 ```
-
-If Stanza cannot find CoreNLP, pass the directory containing `stanford-corenlp-*.jar`:
-
-```powershell
-python main.py --corenlp-home "C:\Users\sugarfree\AppData\Local\StanfordNLP\stanza\Cache\1.11.0\corenlp"
-```
-
-## Run
 
 Run `questions.json`:
 
@@ -49,13 +97,17 @@ Run one question:
 python main.py --question "Do director of film Ten9Eight: Shoot For The Moon and director of film Sabotage (1936 Film) share the same nationality?"
 ```
 
-Run with debug output:
+Run with detailed intermediate output:
 
 ```powershell
-python main.py --debug --question "Which university did the CEO of the artificial intelligence company that developed AlphaGo graduate from and in which city is this university located?"
+python main.py --debug --question "Which actor is older?"
 ```
 
-The program uses `stanza.server.CoreNLPClient` to start and stop the CoreNLP server automatically. You do not need to manually launch `StanfordCoreNLPServer`.
+If Stanza cannot find CoreNLP, pass the CoreNLP directory:
+
+```powershell
+python main.py --corenlp-home "C:\path\to\corenlp"
+```
 
 If a managed port is occupied, choose another endpoint:
 
@@ -65,8 +117,9 @@ python main.py --corenlp-url "http://localhost:9007"
 
 ## Tests
 
-The minimal tests use mocked `DependencyParse` objects and do not require a live CoreNLP server:
+The unit tests use mocked `DependencyParse` objects and fake LLM clients; they
+do not require a live CoreNLP server.
 
 ```powershell
-python -m unittest tests.test_late_binding_graph
+python -m unittest
 ```
