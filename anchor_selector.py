@@ -4,8 +4,6 @@ import re
 from typing import TYPE_CHECKING, Any
 
 import networkx as nx
-
-from graph_builder import restored_dependency_edges, restored_dependency_tokens
 from models import (
     AnchorSelectionResult,
     DependencyParse,
@@ -40,7 +38,7 @@ ILLEGAL_ANCHOR_TEXT = {
     "youngest",
     "younger",
 }
-RELATION_ANCHOR_TEXT = {
+PREDICATE_ONLY_ANCHOR_TEXT = {
     "develop",
     "developed",
     "develops",
@@ -69,7 +67,7 @@ class AnchorSelector:
         weighted_graph: nx.Graph,
         restored_graph_node_candidates: list[RestoredGraphNodeCandidate],
     ) -> AnchorSelectionResult:
-        del replacement, weighted_graph
+        del masked_question, replacement, dependency_parse
         warnings: list[str] = []
         payload: dict[str, Any] = {}
         if self.llm_client is not None:
@@ -78,19 +76,10 @@ class AnchorSelector:
                     ANCHOR_SELECTION_SYSTEM,
                     build_anchor_selection_prompt(
                         original_question=original_question,
-                        masked_question=masked_question,
                         restored_graph_node_candidates=[
                             candidate.to_llm_view()
                             for candidate in restored_graph_node_candidates
                         ],
-                        restored_dependency_tokens=restored_dependency_tokens(
-                            dependency_parse,
-                            restored_graph_node_candidates,
-                        ),
-                        restored_dependency_edges=restored_dependency_edges(
-                            dependency_parse,
-                            restored_graph_node_candidates,
-                        ),
                     ),
                 )
             except Exception as exc:
@@ -101,6 +90,14 @@ class AnchorSelector:
         selected = self._parse_and_validate(payload, restored_graph_node_candidates, warnings)
         if not selected:
             selected = _fallback_anchors(restored_graph_node_candidates, warnings)
+        else:
+            selected = _complete_explicit_anchor_coverage(
+                selected=selected,
+                candidates=restored_graph_node_candidates,
+                weighted_graph=weighted_graph,
+                original_question=original_question,
+                warnings=warnings,
+            )
         return AnchorSelectionResult(
             selected_anchors=selected,
             warnings=warnings,
@@ -138,7 +135,7 @@ class AnchorSelector:
                 )
                 continue
             if _is_illegal_anchor(candidate, text or candidate.display_text):
-                warnings.append(f"Dropped illegal cue/operator anchor text={text or candidate.display_text!r}.")
+                warnings.append(f"Dropped illegal cue/operator/predicate anchor text={text or candidate.display_text!r}.")
                 continue
             if node_id in used:
                 continue
@@ -207,6 +204,61 @@ def _append_fallback_anchor(
     )
 
 
+def _complete_explicit_anchor_coverage(
+    selected: list[SelectedAnchor],
+    candidates: list[RestoredGraphNodeCandidate],
+    weighted_graph: nx.Graph,
+    original_question: str,
+    warnings: list[str],
+) -> list[SelectedAnchor]:
+    completed = list(selected)
+    selected_ids = {anchor.node_id for anchor in completed}
+
+    def add(candidate: RestoredGraphNodeCandidate, anchor_kind: str, reason: str) -> None:
+        if candidate.node_id in selected_ids:
+            return
+        if _is_illegal_anchor(candidate, candidate.display_text):
+            return
+        selected_ids.add(candidate.node_id)
+        completed.append(_anchor_from_candidate(candidate, anchor_kind, reason))
+
+    for candidate in candidates:
+        if _is_explicit_entity_candidate(candidate):
+            add(candidate, "entity", "programmatic completion: explicit entity candidate")
+
+    for candidate in _focus_type_variable_candidates(original_question, candidates):
+        add(candidate, "type_variable", "programmatic completion: explicit question focus")
+
+    for candidate in _cue_scoped_type_variable_candidates(candidates):
+        add(candidate, "type_variable", "programmatic completion: explicit attribute near operator cue")
+
+    for candidate in _path_endpoint_type_variable_candidates(completed, candidates, weighted_graph):
+        add(candidate, "type_variable", "programmatic completion: type-variable endpoint on anchor evidence path")
+
+    if len(completed) > len(selected):
+        warnings.append("Completed explicit anchor coverage with deterministic candidate constraints.")
+    return completed
+
+
+def _anchor_from_candidate(
+    candidate: RestoredGraphNodeCandidate,
+    anchor_kind: str,
+    reason: str,
+) -> SelectedAnchor:
+    return SelectedAnchor(
+        node_id=candidate.node_id,
+        graph_text=candidate.graph_text,
+        restored_text=candidate.restored_text,
+        display_text=candidate.display_text,
+        anchor_kind=anchor_kind,
+        source="graph_node",
+        token_index=candidate.token_index,
+        placeholder=candidate.placeholder,
+        semantic_type_hint=candidate.semantic_type_hint,
+        reason=reason,
+    )
+
+
 def _canonical_anchor_kind(value: object) -> str:
     lowered = str(value or "").strip().lower()
     if lowered in {"entity", "named_entity"}:
@@ -233,11 +285,92 @@ def _unique_candidate_for_text(
     return None
 
 
+def _is_explicit_entity_candidate(candidate: RestoredGraphNodeCandidate) -> bool:
+    return candidate.kind_hint == "entity_candidate" and not _is_illegal_anchor(candidate, candidate.display_text)
+
+
+def _is_completable_type_variable_candidate(candidate: RestoredGraphNodeCandidate) -> bool:
+    return candidate.kind_hint == "type_variable_candidate" and not _is_illegal_anchor(candidate, candidate.display_text)
+
+
+def _focus_type_variable_candidates(
+    original_question: str,
+    candidates: list[RestoredGraphNodeCandidate],
+) -> list[RestoredGraphNodeCandidate]:
+    del original_question
+    ordered = sorted(candidates, key=lambda candidate: candidate.token_index)
+    result: list[RestoredGraphNodeCandidate] = []
+    focus_words = {"which", "what"}
+    stop_words = {"did", "does", "do", "is", "are", "was", "were", "has", "have", "had"}
+    for index, candidate in enumerate(ordered):
+        if _normalize(candidate.display_text) not in focus_words:
+            continue
+        for neighbor in ordered[index + 1 : index + 5]:
+            normalized = _normalize(neighbor.display_text)
+            if normalized in stop_words or normalized in FUNCTION_WORDS_FOR_COMPLETION:
+                break
+            if _is_completable_type_variable_candidate(neighbor):
+                result.append(neighbor)
+                break
+    return result
+
+
+def _cue_scoped_type_variable_candidates(
+    candidates: list[RestoredGraphNodeCandidate],
+) -> list[RestoredGraphNodeCandidate]:
+    ordered = sorted(candidates, key=lambda candidate: candidate.token_index)
+    result: list[RestoredGraphNodeCandidate] = []
+    cue_words = ILLEGAL_ANCHOR_TEXT
+    for index, candidate in enumerate(ordered):
+        if not _is_completable_type_variable_candidate(candidate):
+            continue
+        window = ordered[max(0, index - 3) : index]
+        if any(_normalize(item.display_text) in cue_words for item in window):
+            result.append(candidate)
+    return result
+
+
+def _path_endpoint_type_variable_candidates(
+    selected: list[SelectedAnchor],
+    candidates: list[RestoredGraphNodeCandidate],
+    weighted_graph: nx.Graph,
+) -> list[RestoredGraphNodeCandidate]:
+    candidate_by_id = {candidate.node_id: candidate for candidate in candidates}
+    anchor_node_ids: list[int] = []
+    for anchor in selected:
+        try:
+            token_id = int(anchor.node_id)
+        except (TypeError, ValueError):
+            continue
+        if token_id in weighted_graph and token_id not in anchor_node_ids:
+            anchor_node_ids.append(token_id)
+    if len(anchor_node_ids) < 2:
+        return []
+
+    result: list[RestoredGraphNodeCandidate] = []
+    seen: set[str] = set()
+    for left_index, left in enumerate(anchor_node_ids):
+        for right in anchor_node_ids[left_index + 1 :]:
+            try:
+                path = nx.shortest_path(weighted_graph, left, right, weight="weight")
+            except nx.NetworkXNoPath:
+                continue
+            for token_id in path:
+                candidate = candidate_by_id.get(str(token_id))
+                if candidate is None or candidate.node_id in seen:
+                    continue
+                if not _is_completable_type_variable_candidate(candidate):
+                    continue
+                seen.add(candidate.node_id)
+                result.append(candidate)
+    return result
+
+
 def _is_illegal_anchor(candidate: RestoredGraphNodeCandidate, text: str) -> bool:
     normalized = _normalize(text)
     if normalized in ILLEGAL_ANCHOR_TEXT:
         return True
-    if normalized in RELATION_ANCHOR_TEXT:
+    if normalized in PREDICATE_ONLY_ANCHOR_TEXT:
         return True
     if candidate.kind_hint == "cue_candidate":
         return True
@@ -247,6 +380,24 @@ def _is_illegal_anchor(candidate: RestoredGraphNodeCandidate, text: str) -> bool
     if pos.startswith("VB") or pos in {"AUX", "VERB"}:
         return True
     return False
+
+
+FUNCTION_WORDS_FOR_COMPLETION = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "by",
+    "for",
+    "from",
+    "in",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "with",
+}
 
 
 def _normalize(text: str) -> str:

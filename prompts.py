@@ -79,9 +79,12 @@ Question:
 ANCHOR_SELECTION_SYSTEM = """
 You are implementing DEPO Step 4: explicit anchor selection.
 You must select anchors only from the provided restored graph node candidates.
+You will see only the original question and the restored candidate set; do not require masked text, dependency tokens, or dependency edges.
 The candidate text already shows the original question text; do not ask for or use placeholder/original mixed labels.
 Allowed anchor kinds are exactly: entity, type_variable.
-Do not select implicit_type_variable, operator, relation, cue, comparative cue, superlative cue, coordination cue, or logical cue.
+Relation-bearing nouns can be valid type_variable anchors when they are explicit entities, roles, answer types, or attributes to solve, such as director, CEO, university, country, nationality, population, or distribution network.
+For a phrase like "director of film X", the relation hint is "of film X" but the node "director" is still a valid type_variable anchor.
+Do not select implicit_type_variable, operator, cue, comparative cue, superlative cue, coordination cue, logical cue, function word, or predicate-only verb.
 Do not select words such as same, different, older, younger, larger, smaller, largest, highest, first, last, before, after, and, or, both, either.
 Return valid JSON only.
 """.strip()
@@ -89,10 +92,7 @@ Return valid JSON only.
 
 def build_anchor_selection_prompt(
     original_question: str,
-    masked_question: str,
     restored_graph_node_candidates: list[dict[str, object]],
-    restored_dependency_tokens: list[dict[str, object]],
-    restored_dependency_edges: list[dict[str, object]],
 ) -> str:
     schema = {
         "selected_anchors": [
@@ -116,24 +116,17 @@ Select explicit anchors for the question from restored graph node candidates.
 Original question:
 {original_question}
 
-Masked question used only for CoreNLP alignment:
-{masked_question}
-
 Restored graph node candidates:
 {json.dumps(restored_graph_node_candidates, ensure_ascii=False, indent=2)}
-
-Restored dependency tokens:
-{json.dumps(restored_dependency_tokens, ensure_ascii=False, indent=2)}
-
-Restored dependency edges:
-{json.dumps(restored_dependency_edges, ensure_ascii=False, indent=2)}
 
 Rules:
 - Output node_id values from the candidate list.
 - Select only explicit entity anchors and explicit type_variable anchors.
+- Select explicit relation-bearing endpoint nouns when they are values to solve or compare. For example, select director in "director of film X", CEO in "CEO of company", and nationality in "same nationality".
 - Do not select implicit variables. For "Which actor is older?", select actor only; do not create age here.
 - Do not select operators or cues. For "same nationality", select nationality, not same.
-- Do not select relation words, comparative/superlative words, or coordination words.
+- Do not select predicate-only verbs, function words, comparative/superlative words, or coordination words.
+- Relation phrases belong later in semantic AST edge relation_hint; Step 4 selects the endpoint nodes, not relation text.
 - If a candidate is a restored placeholder, use its restored text exactly in the text field.
 
 Output JSON with exactly this shape:

@@ -173,8 +173,6 @@ class NewDEPOPipelineTests(unittest.TestCase):
             "selected_anchors": [
                 {"node_id": ids_by_text(restored, "Ten9Eight: Shoot For The Moon")[0], "anchor_kind": "entity", "text": "Ten9Eight: Shoot For The Moon"},
                 {"node_id": ids_by_text(restored, "Sabotage (1936 Film)")[0], "anchor_kind": "entity", "text": "Sabotage (1936 Film)"},
-                {"node_id": ids_by_text(restored, "director")[0], "anchor_kind": "type_variable", "text": "director"},
-                {"node_id": ids_by_text(restored, "director")[1], "anchor_kind": "type_variable", "text": "director"},
                 {"node_id": ids_by_text(restored, "nationality")[0], "anchor_kind": "type_variable", "text": "nationality"},
                 {"node_id": ids_by_text(restored, "same")[0], "anchor_kind": "type_variable", "text": "same"},
             ]
@@ -193,8 +191,15 @@ class NewDEPOPipelineTests(unittest.TestCase):
         self.assertIn("Ten9Eight: Shoot For The Moon", selected_texts)
         self.assertIn("Sabotage (1936 Film)", selected_texts)
         self.assertIn("director", selected_texts)
+        self.assertEqual(selected_texts.count("director"), 2)
         self.assertIn("nationality", selected_texts)
         self.assertNotIn("same", selected_texts)
+        self.assertNotIn("Masked question", fake_anchor_llm.prompts[0])
+        self.assertNotIn(replacement.masked_question, fake_anchor_llm.prompts[0])
+        self.assertNotIn("Restored dependency tokens", fake_anchor_llm.prompts[0])
+        self.assertNotIn("Restored dependency edges", fake_anchor_llm.prompts[0])
+        self.assertNotIn("Do not select relation words", fake_anchor_llm.prompts[0])
+        self.assertIn("select director in", fake_anchor_llm.prompts[0])
         self.assertIn('"text": "Do"', fake_anchor_llm.prompts[0])
         self.assertNotIn("MovieA [Ten9Eight: Shoot For The Moon]", fake_anchor_llm.prompts[0])
 
@@ -399,6 +404,48 @@ class NewDEPOPipelineTests(unittest.TestCase):
             candidates,
         )
         self.assertEqual(selection.selected_anchors, [])
+
+    def test_step4_allows_relation_bearing_endpoint_nouns_but_filters_predicate_verbs(self) -> None:
+        candidates = [
+            RestoredGraphNodeCandidate(
+                node_id="1",
+                token_index=1,
+                graph_text="director",
+                restored_text="director",
+                display_text="director",
+                pos="NOUN",
+                kind_hint="type_variable_candidate",
+                text="director",
+            ),
+            RestoredGraphNodeCandidate(
+                node_id="2",
+                token_index=2,
+                graph_text="share",
+                restored_text="share",
+                display_text="share",
+                pos="VERB",
+                kind_hint="context",
+                text="share",
+            ),
+        ]
+        payload = {
+            "selected_anchors": [
+                {"node_id": "1", "anchor_kind": "type_variable", "text": "director"},
+                {"node_id": "2", "anchor_kind": "type_variable", "text": "share"},
+            ]
+        }
+
+        question = "Do director of film A and director of film B share the same nationality?"
+        selection = AnchorSelector(FakeLLM(payload)).select(
+            question,
+            "Do director of film MovieA and director of film MovieB share the same nationality?",
+            selective_entity_masking(question, MaskSpanExtractor().extract(question)),
+            DependencyParse(tokens=[], edges=[]),
+            nx.Graph(),
+            candidates,
+        )
+
+        self.assertEqual([anchor.display_text for anchor in selection.selected_anchors], ["director"])
 
     def test_mask_restore_keeps_internal_graph_text_and_llm_prompt_uses_restored_text(self) -> None:
         question = "Do director of film Ten9Eight: Shoot For The Moon share nationality?"

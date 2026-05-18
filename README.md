@@ -41,10 +41,19 @@ anchor decisions are made on restored original question text.
 
 6. **Explicit anchor selection**
    Step 4 asks the LLM to select only explicit anchors from restored graph node
-   candidates. Allowed anchor kinds are `entity` and `type_variable`. Operator
-   cues and implicit variables are forbidden here, so words such as `same`,
-   `older`, `largest`, `before`, `after`, `and`, and `or` are filtered by code
-   validation if the LLM returns them.
+   candidates. The LLM prompt contains only the original question and the
+   restored candidate set; masked text, dependency tokens, and dependency edges
+   are intentionally withheld to keep the task focused. Allowed anchor kinds are
+   `entity` and `type_variable`. Relation-bearing endpoint nouns such as
+   `director`, `CEO`, `nationality`, or `population` are valid type-variable
+   anchors even when they appear inside phrases such as `director of film X`.
+   Pure predicate/function/cue words remain forbidden, so words such as `share`,
+   `developed`, `same`, `older`, `largest`, `before`, `after`, `and`, and `or`
+   are filtered by code validation if the LLM returns them. After LLM selection,
+   code also completes obvious explicit anchors from candidate constraints:
+   restored entity candidates, wh-focus type variables, cue-scoped explicit
+   attributes, and type-variable endpoints on shortest evidence paths between
+   selected anchors.
 
 7. **Anchor connected subgraph**
    Step 5 uses the selected anchor `node_id` values to return to the masked
