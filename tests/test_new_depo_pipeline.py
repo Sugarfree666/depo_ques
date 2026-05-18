@@ -350,6 +350,87 @@ class NewDEPOPipelineTests(unittest.TestCase):
         )
         self.assertEqual(selection.selected_anchors[0].display_text, "distribution network")
 
+    def test_mask_span_llm_uses_returned_span_without_regex_trim(self) -> None:
+        question = (
+            "Which university did the CEO of the artificial intelligence company that developed "
+            "AlphaGo graduate from?"
+        )
+        span_start = question.index("the artificial intelligence company")
+        payload = {
+            "mask_spans": [
+                {
+                    "text": "the artificial intelligence company",
+                    "start_char": span_start,
+                    "end_char": span_start + len("the artificial intelligence company"),
+                    "kind_hint": "type_variable",
+                    "semantic_type_hint": "Company",
+                    "reason": "multi-word type variable",
+                }
+            ]
+        }
+
+        mask_result = MaskSpanExtractor(FakeLLM(payload)).extract(question)
+        replacement = selective_entity_masking(question, mask_result)
+
+        self.assertEqual([span.text for span in mask_result.mask_spans], ["the artificial intelligence company"])
+        self.assertEqual(
+            replacement.masked_question,
+            "Which university did the CEO of CompanyA that developed AlphaGo graduate from?",
+        )
+
+    def test_mask_span_llm_success_does_not_merge_heuristic_spans(self) -> None:
+        question = "Who was born earlier, Elmer W. Conti or Seth Joshua?"
+        span_start = question.index("Seth Joshua")
+        payload = {
+            "mask_spans": [
+                {
+                    "text": "Seth Joshua",
+                    "start_char": span_start,
+                    "end_char": span_start + len("Seth Joshua"),
+                    "kind_hint": "entity",
+                    "semantic_type_hint": "Person",
+                    "reason": "LLM returned only this person name",
+                }
+            ]
+        }
+
+        mask_result = MaskSpanExtractor(FakeLLM(payload)).extract(question)
+        replacement = selective_entity_masking(question, mask_result)
+
+        self.assertEqual([span.text for span in mask_result.mask_spans], ["Seth Joshua"])
+        self.assertEqual(
+            replacement.masked_question,
+            "Who was born earlier, Elmer W. Conti or PersonA?",
+        )
+
+    def test_mask_span_llm_accepts_parser_fragile_single_token_entities(self) -> None:
+        question = "Which company developed AlphaGo with IBM?"
+        payload = {
+            "mask_spans": [
+                {
+                    "text": "AlphaGo",
+                    "start_char": question.index("AlphaGo"),
+                    "end_char": question.index("AlphaGo") + len("AlphaGo"),
+                    "kind_hint": "entity",
+                    "semantic_type_hint": "Product",
+                    "reason": "mixed-case product name",
+                },
+                {
+                    "text": "IBM",
+                    "start_char": question.index("IBM"),
+                    "end_char": question.index("IBM") + len("IBM"),
+                    "kind_hint": "entity",
+                    "semantic_type_hint": "Organization",
+                    "reason": "acronym organization name",
+                },
+            ]
+        }
+
+        mask_result = MaskSpanExtractor(FakeLLM(payload)).extract(question)
+
+        self.assertEqual([span.text for span in mask_result.mask_spans], ["AlphaGo", "IBM"])
+        self.assertEqual([span.semantic_type_hint for span in mask_result.mask_spans], ["Product", "Organization"])
+
     def test_simple_type_variables_are_not_over_masked(self) -> None:
         question = "Which director is CEO of the university in the city and has nationality?"
         mask_result = MaskSpanExtractor().extract(question)
@@ -366,6 +447,21 @@ class NewDEPOPipelineTests(unittest.TestCase):
             [("Ryan Tubridy", "Person"), ("Mauro Massironi", "Person")],
         )
         self.assertEqual(replacement.masked_question, "Who is older, PersonA or PersonB?")
+
+    def test_person_name_with_middle_initial_is_masked(self) -> None:
+        question = "Who was born earlier, Elmer W. Conti or Seth Joshua?"
+
+        mask_result = MaskSpanExtractor().extract(question)
+        replacement = selective_entity_masking(question, mask_result)
+
+        self.assertEqual(
+            [(span.text, span.semantic_type_hint) for span in mask_result.mask_spans],
+            [("Elmer W. Conti", "Person"), ("Seth Joshua", "Person")],
+        )
+        self.assertEqual(
+            replacement.masked_question,
+            "Who was born earlier, PersonA or PersonB?",
+        )
 
     def test_capitalized_location_context_is_not_forced_to_person(self) -> None:
         question = "Which city is larger, New York City or Los Angeles?"

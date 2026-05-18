@@ -23,6 +23,30 @@ SIMPLE_TYPE_VARIABLES = {
     "university",
 }
 
+LEADING_TYPE_SPAN_WORDS = {"a", "an", "the"}
+NAMED_ENTITY_SEMANTIC_TYPES = {
+    "album",
+    "book",
+    "city",
+    "company",
+    "country",
+    "event",
+    "film",
+    "institution",
+    "location",
+    "movie",
+    "organization",
+    "organisation",
+    "person",
+    "place",
+    "product",
+    "region",
+    "series",
+    "song",
+    "university",
+    "work",
+}
+
 TYPE_PHRASE_PATTERNS = [
     (r"\blocal food distribution network\b", "type_variable", "Network", "multi-word functional noun phrase"),
     (r"\bfood distribution network\b", "type_variable", "Network", "multi-word functional noun phrase"),
@@ -93,6 +117,7 @@ NON_PERSON_NAME_WORDS = {
 }
 
 PERSON_NAME_PARTICLES = {"al", "bin", "da", "de", "del", "der", "di", "la", "le", "van", "von"}
+CAPITALIZED_ENTITY_TOKEN = r"(?:[A-Z][A-Za-z0-9']+|[A-Z]\.|[A-Z]{2,}(?:\.)?)"
 
 CLAUSE_BOUNDARY = {
     "and",
@@ -130,20 +155,20 @@ class MaskSpanExtractor:
 
     def extract(self, question: str) -> MaskSpanResult:
         warnings: list[str] = []
-        spans: list[MaskSpan] = []
         if self.llm_client is not None:
             try:
                 payload = self.llm_client.chat_json(
                     MASK_SPAN_EXTRACTION_SYSTEM,
                     build_mask_span_extraction_prompt(question),
                 )
-                spans = self._parse_payload(question, payload, warnings)
+                return MaskSpanResult(
+                    mask_spans=self._parse_payload(question, payload, warnings),
+                    warnings=warnings,
+                )
             except Exception as exc:
                 warnings.append(f"Mask span LLM failed; using heuristic fallback: {exc}")
 
-        heuristic_spans = _heuristic_mask_spans(question)
-        spans = _merge_spans(question, [*spans, *heuristic_spans], warnings)
-        return MaskSpanResult(mask_spans=spans, warnings=warnings)
+        return MaskSpanResult(mask_spans=_heuristic_mask_spans(question), warnings=warnings)
 
     @staticmethod
     def _parse_payload(
@@ -169,9 +194,6 @@ class MaskSpanExtractor:
             if start is None or end is None:
                 warnings.append(f"Could not resolve mask span text={text!r}.")
                 continue
-            if not _is_mask_worthy(question[start:end]):
-                warnings.append(f"Dropped over-broad/simple mask span text={question[start:end]!r}.")
-                continue
             kind_hint = _normalize_kind_hint(raw.get("kind_hint", raw.get("kind", "entity")))
             semantic_type_hint = str(raw.get("semantic_type_hint", raw.get("semantic_type", ""))).strip() or None
             spans.append(
@@ -180,14 +202,7 @@ class MaskSpanExtractor:
                     start_char=start,
                     end_char=end,
                     kind_hint=kind_hint,
-                    semantic_type_hint=_refine_semantic_type(
-                        question=question,
-                        text=question[start:end],
-                        kind_hint=kind_hint,
-                        existing=semantic_type_hint,
-                        start=start,
-                        end=end,
-                    ),
+                    semantic_type_hint=semantic_type_hint,
                     reason=str(raw.get("reason", "")).strip(),
                 )
             )
@@ -268,7 +283,7 @@ def _looks_like_title_continuation(question: str, position: int) -> bool:
 def _parenthetical_entity_spans(question: str) -> list[MaskSpan]:
     spans: list[MaskSpan] = []
     pattern = re.compile(
-        r"\b[A-Z][A-Za-z0-9']*(?:\s+[A-Z0-9][A-Za-z0-9']*){0,5}\s*\([^)]*\)"
+        rf"\b{CAPITALIZED_ENTITY_TOKEN}(?:\s+{CAPITALIZED_ENTITY_TOKEN}){{0,5}}\s*\([^)]*\)"
     )
     for match in pattern.finditer(question):
         text = match.group(0)
@@ -309,7 +324,7 @@ def _quoted_spans(question: str) -> list[MaskSpan]:
 def _capitalized_entity_spans(question: str) -> list[MaskSpan]:
     spans: list[MaskSpan] = []
     pattern = re.compile(
-        r"\b(?:[A-Z][A-Za-z0-9']+|[A-Z]{2,})(?:\s+(?:of|the|and|for|de|la|[A-Z][A-Za-z0-9']+|[A-Z]{2,})){1,6}\b"
+        rf"\b{CAPITALIZED_ENTITY_TOKEN}(?:\s+(?:of|the|and|for|de|la|{CAPITALIZED_ENTITY_TOKEN})){{1,6}}\b"
     )
     for match in pattern.finditer(question):
         text = match.group(0).strip()
@@ -363,8 +378,23 @@ def _merge_spans(
         start, end = _resolve_span(question, span.text, span.start_char, span.end_char)
         if start is None or end is None:
             continue
+        kind_hint = _normalize_kind_hint(span.kind_hint)
+        start, end = _trim_mask_span(
+            question=question,
+            start=start,
+            end=end,
+            kind_hint=kind_hint,
+            semantic_type_hint=span.semantic_type_hint,
+        )
         text = question[start:end]
-        if not _is_mask_worthy(text):
+        if not _is_mask_worthy(
+            text,
+            kind_hint=kind_hint,
+            semantic_type_hint=span.semantic_type_hint,
+            question=question,
+            start=start,
+            end=end,
+        ):
             continue
         key = (start, end)
         if key in seen:
@@ -375,7 +405,7 @@ def _merge_spans(
                 text=text,
                 start_char=start,
                 end_char=end,
-                kind_hint=_normalize_kind_hint(span.kind_hint),
+                kind_hint=kind_hint,
                 semantic_type_hint=_refine_semantic_type(
                     question=question,
                     text=text,
@@ -400,21 +430,86 @@ def _merge_spans(
     return result
 
 
-def _is_mask_worthy(text: str) -> bool:
+def _trim_mask_span(
+    question: str,
+    start: int,
+    end: int,
+    kind_hint: str,
+    semantic_type_hint: str | None,
+) -> tuple[int, int]:
+    del semantic_type_hint
+    while start < end and question[start].isspace():
+        start += 1
+    while end > start and question[end - 1].isspace():
+        end -= 1
+
+    if kind_hint == "type_variable":
+        while True:
+            match = re.match(r"\s*([A-Za-z][A-Za-z0-9'-]*)(\s+)", question[start:end])
+            if not match or match.group(1).lower() not in LEADING_TYPE_SPAN_WORDS:
+                break
+            start += match.end()
+    return start, end
+
+
+def _is_mask_worthy(
+    text: str,
+    kind_hint: str = "entity",
+    semantic_type_hint: str | None = None,
+    question: str = "",
+    start: int | None = None,
+    end: int | None = None,
+) -> bool:
+    del question, start, end
     stripped = text.strip()
     if _is_simple_type_variable(stripped):
         return False
     token_count = _token_count(stripped)
-    if token_count < 2:
-        return bool(re.search(r"[:()\[\]{}\"'\u201c\u201d\u2018\u2019,\-\u2013\u2014]|\d", stripped))
-    return bool(
-        re.search(r"[:()\[\]{}\"'\u201c\u201d\u2018\u2019,\-\u2013\u2014]|\d", stripped)
-        or token_count >= 2
+    has_parser_fragile_punctuation = bool(
+        re.search(r"[:()\[\]{}\"'\u201c\u201d\u2018\u2019,\-\u2013\u2014./&]", stripped)
     )
+    has_digit = bool(re.search(r"\d", stripped))
+
+    if kind_hint == "type_variable":
+        return token_count >= 2 or has_parser_fragile_punctuation or has_digit
+
+    if token_count < 2:
+        if has_parser_fragile_punctuation or has_digit:
+            return True
+        if _looks_like_acronym(stripped) or _looks_like_mixedcase_name(stripped):
+            return True
+        return _has_named_entity_semantic_type(semantic_type_hint) and _looks_like_single_token_proper_name(stripped)
+    return True
 
 
 def _is_simple_type_variable(text: str) -> bool:
     return text.strip().lower() in SIMPLE_TYPE_VARIABLES
+
+
+def _looks_like_acronym(text: str) -> bool:
+    stripped = text.strip(".")
+    return bool(
+        re.fullmatch(r"(?:[A-Z]\.){2,}[A-Z]?\.?", text)
+        or re.fullmatch(r"[A-Z]{2,}[A-Z0-9]*", stripped)
+    )
+
+
+def _looks_like_mixedcase_name(text: str) -> bool:
+    return bool(
+        re.fullmatch(r"[A-Za-z]*[a-z][A-Z][A-Za-z0-9]*", text)
+        or re.fullmatch(r"[A-Za-z]+[0-9][A-Za-z0-9]*", text)
+    )
+
+
+def _looks_like_single_token_proper_name(text: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z][A-Za-z0-9'._-]*", text))
+
+
+def _has_named_entity_semantic_type(value: str | None) -> bool:
+    normalized = re.sub(r"[^A-Za-z]+", " ", value or "").strip().lower()
+    if not normalized:
+        return False
+    return any(word in NAMED_ENTITY_SEMANTIC_TYPES for word in normalized.split())
 
 
 def _starts_sentence_only(question: str, start: int, text: str) -> bool:
@@ -518,7 +613,17 @@ def _question_has_human_context(
 
 def _normalize_kind_hint(value: object) -> str:
     lowered = str(value or "").strip().lower()
-    if lowered in {"type", "type_variable", "variable", "type-variable"}:
+    if lowered in {
+        "functional_noun_phrase",
+        "function_noun_phrase",
+        "multi_word_type",
+        "noun_phrase",
+        "type",
+        "type_phrase",
+        "type_variable",
+        "type-variable",
+        "variable",
+    }:
         return "type_variable"
     return "entity"
 

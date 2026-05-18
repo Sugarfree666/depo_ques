@@ -19,10 +19,11 @@ ALLOWED_OPERATORS = [
 
 MASK_SPAN_EXTRACTION_SYSTEM = """
 You are implementing DEPO Step 1: selective complex-span masking only.
-Your job is to identify only spans that should be replaced by a POS-hint placeholder before CoreNLP parsing.
+Your job is to identify spans that should be replaced by a POS-hint placeholder before CoreNLP parsing.
+This step protects parser-fragile surface spans only.
 Do not perform anchor extraction.
 Do not output selected anchors, implicit variables, operators, relations, AST nodes, or subquestions.
-Mask only complex named entities and multi-word type/function noun phrases that are likely to be fragmented by a dependency parser.
+Extract complex named entities, parser-fragile proper names, titles, abbreviations/acronyms, multi-word type variables, and multi-word functional noun phrases that are likely to be fragmented or mistagged by a dependency parser.
 Keep simple type variables such as director, CEO, university, city, nationality, age, population, country, and actor unmasked unless they are part of a larger multi-word phrase.
 Return valid JSON only.
 """.strip()
@@ -44,16 +45,30 @@ def build_mask_span_extraction_prompt(question: str) -> str:
     return f"""
 Identify only spans that should be masked before CoreNLP parsing.
 
-Mask:
-- complex named entities with colon, parentheses, quotes, digits, or special punctuation
-- continuous multi-word named entities such as New York City or University of Southern California
-- multi-word type variables or functional noun phrases such as distribution network, artificial intelligence company, mixed-use space, or local food distribution network
+This is not anchor extraction and not question decomposition. The output is only a list of surface spans in the original question that need parser protection.
+
+Mask these span types:
+- Complex named entities with colon, parentheses, quotes, digits, hyphens, apostrophes, periods, slashes, or other special punctuation.
+- Parser-fragile proper names, including person names, organization names, institution names, place names, product names, work titles, event names, abbreviations, and acronyms.
+- Continuous multi-word named entities such as Ryan Tubridy, New York City, University of Southern California, or Bank of America.
+- Titles and named works such as films, books, songs, albums, series, papers, statutes, and artworks; keep the whole title as one span.
+- Multi-word type variables or functional noun phrases such as distribution network, artificial intelligence company, mixed-use space, local food distribution network, public research university, or chief executive officer.
+
+Span boundary rules:
+- Use exact original question character offsets, start inclusive and end exclusive.
+- Return the minimal contiguous span that should become one placeholder token.
+- For named entities and titles, keep the full official/name-like surface form.
+- For type variables and functional noun phrases, exclude leading determiners such as the/a/an unless they are part of a named title.
+- Do not include relative clauses, prepositional complements, comparison words, or coordination words unless they are part of a proper name/title.
+- If two candidate spans overlap, prefer the larger coherent entity/title, or the compact functional noun phrase for type variables.
 
 Semantic type hints:
 - Choose a semantic_type_hint that preserves the original POS/semantic role for placeholder generation.
 - Person names in human contexts such as who/whom/whose, older/younger, actor, CEO, director, author, player, or president should use semantic_type_hint: Person.
-- Location names should use City/Country/Location when the question context asks for places.
+- Location names should use City/Country/Region/Location when the question context asks for places.
 - Organizations and institutions should use Company/Organization/University/Institution when supported by the span or context.
+- Named works should use Film/Book/Song/Album/Series/Work when supported by local wording.
+- Multi-word type variables should use kind_hint: type_variable and a semantic_type_hint for their head class.
 
 Do not mask simple one-word type variables by default:
 director, CEO, university, city, nationality, age, population, country, actor.
