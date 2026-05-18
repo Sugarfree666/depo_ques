@@ -11,6 +11,19 @@ class QuestionRecord:
 
 
 @dataclass
+class SemanticNormalizationResult:
+    original_question: str
+    normalized_question: str
+    changed: bool = False
+    added_type_variables: list[dict[str, str]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    raw_payload: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class ExtractedNode:
     placeholder: str
     text: str

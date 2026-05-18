@@ -14,6 +14,7 @@ from models import (
     QuestionRecord,
     RestoredAnchorConnectedSubgraph,
     RestoredGraphNodeCandidate,
+    SemanticNormalizationResult,
     SemanticASTResult,
 )
 
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     from corenlp_parser import CoreNLPParser
     from graph_builder import GraphBuilder
     from mask_span_extractor import MaskSpanExtractor
+    from question_normalizer import SemanticQuestionNormalizer
     from subquestion_generator import SubquestionGenerator
 
 
@@ -71,9 +73,11 @@ def main() -> int:
         from graph_builder import GraphBuilder
         from llm_client import LLMClient
         from mask_span_extractor import MaskSpanExtractor
+        from question_normalizer import SemanticQuestionNormalizer
         from subquestion_generator import SubquestionGenerator
 
         llm_client = LLMClient(api_key=api_key, base_url=base_url, model="gpt-4o-mini")
+        question_normalizer = SemanticQuestionNormalizer(llm_client)
         mask_span_extractor = MaskSpanExtractor(llm_client)
         graph_builder = GraphBuilder()
         anchor_selector = AnchorSelector(llm_client)
@@ -96,6 +100,7 @@ def main() -> int:
                     anchor_selector=anchor_selector,
                     semantic_ast_optimizer=semantic_ast_optimizer,
                     subquestion_generator=subquestion_generator,
+                    question_normalizer=question_normalizer,
                     debug=args.debug,
                 )
                 print_result(index, record, result, debug=args.debug)
@@ -118,14 +123,25 @@ def run_pipeline(
     anchor_selector: "AnchorSelector",
     semantic_ast_optimizer: "SemanticASTOptimizer",
     subquestion_generator: "SubquestionGenerator",
+    question_normalizer: "SemanticQuestionNormalizer | None" = None,
     debug: bool = False,
 ) -> dict[str, Any]:
     del index, debug
     from placeholder import selective_entity_masking
 
-    mask_spans = mask_span_extractor.extract(record.question)
+    semantic_normalization = (
+        question_normalizer.normalize(record.question)
+        if question_normalizer is not None
+        else SemanticNormalizationResult(
+            original_question=record.question,
+            normalized_question=record.question,
+            changed=False,
+        )
+    )
+    processing_question = semantic_normalization.normalized_question
+    mask_spans = mask_span_extractor.extract(processing_question)
     replacement = selective_entity_masking(
-        original_question=record.question,
+        original_question=processing_question,
         extracted_nodes=mask_spans,
     )
     dependency_parse = parser.parse(replacement.masked_question)
@@ -139,7 +155,7 @@ def run_pipeline(
         replacement=replacement,
     )
     anchor_selection = anchor_selector.select(
-        original_question=record.question,
+        original_question=processing_question,
         masked_question=replacement.masked_question,
         replacement=replacement,
         dependency_parse=dependency_parse,
@@ -156,16 +172,17 @@ def run_pipeline(
         replacement=replacement,
     )
     semantic_ast = semantic_ast_optimizer.optimize(
-        original_question=record.question,
+        original_question=processing_question,
         replacement=replacement,
         selected_anchors=anchor_selection.selected_anchors,
         restored_anchor_connected_subgraph=restored_anchor_connected_subgraph,
     )
     subquestions = subquestion_generator.generate(
-        original_question=record.question,
+        original_question=processing_question,
         ast=semantic_ast,
     )
     return {
+        "semantic_normalization": semantic_normalization,
         "mask_spans": mask_spans,
         "replacement": replacement,
         "dependency_parse": dependency_parse,
@@ -183,6 +200,7 @@ def run_pipeline(
 def print_result(index: int, record: QuestionRecord, result: dict[str, Any], debug: bool = False) -> None:
     from graph_builder import format_weighted_graph_edges
 
+    semantic_normalization: SemanticNormalizationResult = result["semantic_normalization"]
     mask_spans: MaskSpanResult = result["mask_spans"]
     replacement: MaskReplacement = result["replacement"]
     dependency_parse = result["dependency_parse"]
@@ -206,7 +224,13 @@ def print_result(index: int, record: QuestionRecord, result: dict[str, Any], deb
     print(record.question)
     print()
 
-    print("[1. Mask Spans]")
+    print("[1. Semantic-Normalized Question]")
+    print(semantic_normalization.normalized_question)
+    if debug:
+        _print_warnings(semantic_normalization.warnings)
+    print()
+
+    print("[2. Mask Spans]")
     if replacement.mask_mappings:
         for mapping in replacement.mask_mappings:
             print(f"  - {mapping.original_text} -> {mapping.placeholder}")
@@ -216,11 +240,11 @@ def print_result(index: int, record: QuestionRecord, result: dict[str, Any], deb
         _print_warnings(mask_spans.warnings)
     print()
 
-    print("[2. Selective Masked Question]")
+    print("[3. Selective Masked Question]")
     print(replacement.masked_question)
     print()
 
-    print("[3. CoreNLP Dependency Parse]")
+    print("[4. CoreNLP Dependency Parse]")
     print("Edges:")
     if dependency_parse.edges:
         for edge in dependency_parse.edges:
@@ -229,7 +253,7 @@ def print_result(index: int, record: QuestionRecord, result: dict[str, Any], deb
         print("  (no dependency edges)")
     print()
 
-    print("[4. Weighted Undirected Dependency Graph]")
+    print("[5. Weighted Undirected Dependency Graph]")
     weighted_lines = format_weighted_graph_edges(weighted_graph)
     if weighted_lines:
         for line in weighted_lines:
@@ -238,14 +262,14 @@ def print_result(index: int, record: QuestionRecord, result: dict[str, Any], deb
         print("  (no weighted edges)")
     print()
 
-    print("[5. Restored Graph Node Candidates]")
+    print("[6. Restored Graph Node Candidates]")
     for candidate in restored_graph_node_candidates:
         print(f"  - {candidate.display_text}")
     if not restored_graph_node_candidates:
         print("  (none)")
     print()
 
-    print("[6. Selected Explicit Anchors]")
+    print("[7. Selected Explicit Anchors]")
     if anchor_selection.selected_anchors:
         for anchor in anchor_selection.selected_anchors:
             print(f"  - {anchor.display_text}")
@@ -255,7 +279,7 @@ def print_result(index: int, record: QuestionRecord, result: dict[str, Any], deb
         _print_warnings(anchor_selection.warnings)
     print()
 
-    print("[7. Anchor Connected Subgraph]")
+    print("[8. Anchor Connected Subgraph]")
     print("Edges:")
     subgraph_edge_lines = _format_restored_subgraph_edges(restored_anchor_connected_subgraph)
     if subgraph_edge_lines:
@@ -265,13 +289,13 @@ def print_result(index: int, record: QuestionRecord, result: dict[str, Any], deb
         print("  (no subgraph edges)")
     print()
 
-    print("[8. Final Semantic AST]")
+    print("[9. Final Semantic AST]")
     _print_semantic_ast(semantic_ast)
     if debug:
         _print_warnings(semantic_ast.warnings)
     print()
 
-    print("[9. Atomic Subquestions]")
+    print("[10. Atomic Subquestions]")
     if not subquestions:
         print("  (no atomic subquestions generated)")
     for item in subquestions:

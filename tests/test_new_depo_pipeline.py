@@ -8,19 +8,24 @@ import networkx as nx
 from anchor_selector import AnchorSelector
 from ast_builder import SemanticASTOptimizer
 from graph_builder import GraphBuilder, relation_weight
+from main import run_pipeline
 from mask_span_extractor import MaskSpanExtractor
 from models import (
+    AnchorSelectionResult,
     CoreNLPToken,
     DependencyEdge,
     DependencyParse,
+    QuestionRecord,
     RestoredAnchorConnectedSubgraph,
     RestoredGraphNodeCandidate,
     SemanticASTEdge,
     SemanticASTNode,
+    SemanticNormalizationResult,
     SemanticASTPrimaryOperator,
     SemanticASTResult,
 )
 from placeholder import selective_entity_masking
+from question_normalizer import SemanticQuestionNormalizer
 from subquestion_generator import SubquestionGenerator, compile_execution_plan
 
 
@@ -79,6 +84,20 @@ class BadBindingFakeLLM:
         return {"question": "Who is the director of Ten9Eight: Shoot For The Moon?"}
 
 
+class FixedQuestionNormalizer:
+    def __init__(self, normalized_question: str) -> None:
+        self.normalized_question = normalized_question
+        self.questions: list[str] = []
+
+    def normalize(self, question: str) -> SemanticNormalizationResult:
+        self.questions.append(question)
+        return SemanticNormalizationResult(
+            original_question=question,
+            normalized_question=self.normalized_question,
+            changed=question != self.normalized_question,
+        )
+
+
 def make_tokens(question: str) -> list[CoreNLPToken]:
     pos_by_word = {
         "MovieA": "PROPN",
@@ -131,6 +150,145 @@ def ids_by_text(candidates: list[RestoredGraphNodeCandidate], text: str) -> list
 
 
 class NewDEPOPipelineTests(unittest.TestCase):
+    def test_semantic_normalizer_accepts_safe_comparison_rewrite(self) -> None:
+        question = "Who is older, Ryan Tubridy or Mauro Massironi?"
+        payload = {
+            "normalized_question": "Which of Ryan Tubridy and Mauro Massironi has the greater age?",
+            "changed": True,
+            "added_type_variables": [
+                {"text": "age", "trigger_text": "older", "reason": "The comparative cue names the compared attribute."}
+            ],
+        }
+
+        result = SemanticQuestionNormalizer(FakeLLM(payload)).normalize(question)
+
+        self.assertTrue(result.changed)
+        self.assertEqual(
+            result.normalized_question,
+            "Which of Ryan Tubridy and Mauro Massironi has the greater age?",
+        )
+        self.assertEqual(result.added_type_variables[0]["text"], "age")
+        self.assertEqual(result.warnings, [])
+
+    def test_semantic_normalizer_uses_original_when_no_rewrite_needed(self) -> None:
+        question = "Which country has the largest population?"
+        payload = {
+            "normalized_question": question,
+            "changed": False,
+            "added_type_variables": [],
+        }
+
+        result = SemanticQuestionNormalizer(FakeLLM(payload)).normalize(question)
+
+        self.assertFalse(result.changed)
+        self.assertEqual(result.normalized_question, question)
+        self.assertEqual(result.warnings, [])
+
+    def test_semantic_normalizer_uses_nonempty_llm_rewrite_directly(self) -> None:
+        question = "Who is older, Ryan Tubridy or Mauro Massironi?"
+        normalized = "Which person is older, Ryan Tubridy or Mauro Massironi?"
+        payload = {
+            "normalized_question": normalized,
+            "changed": True,
+            "added_type_variables": [],
+        }
+
+        result = SemanticQuestionNormalizer(FakeLLM(payload)).normalize(question)
+
+        self.assertTrue(result.changed)
+        self.assertEqual(result.normalized_question, normalized)
+        self.assertEqual(result.warnings, [])
+
+    def test_semantic_normalizer_preserves_added_type_variable_metadata_when_present(self) -> None:
+        question = "Who is older, Ryan Tubridy or Mauro Massironi?"
+        normalized = "Which of Ryan Tubridy and Mauro Massironi has the greater age?"
+        payload = {
+            "normalized_question": normalized,
+            "changed": True,
+            "added_type_variables": [{"text": "age", "trigger_text": "older"}],
+        }
+
+        result = SemanticQuestionNormalizer(FakeLLM(payload)).normalize(question)
+
+        self.assertTrue(result.changed)
+        self.assertEqual(result.normalized_question, normalized)
+        self.assertEqual(result.added_type_variables, [{"text": "age", "trigger_text": "older", "reason": ""}])
+        self.assertEqual(result.warnings, [])
+
+    def test_semantic_normalizer_preserves_placeholders(self) -> None:
+        question = "Who is older, PersonA or PersonB?"
+        payload = {
+            "normalized_question": "Which of PersonA and PersonB has the greater age?",
+            "changed": True,
+            "added_type_variables": [{"text": "age", "trigger_text": "older"}],
+        }
+
+        result = SemanticQuestionNormalizer(FakeLLM(payload)).normalize(question)
+
+        self.assertTrue(result.changed)
+        self.assertEqual(result.normalized_question, "Which of PersonA and PersonB has the greater age?")
+        self.assertEqual(result.warnings, [])
+
+    def test_pipeline_runs_masking_on_semantic_normalized_question(self) -> None:
+        class RecordingParser:
+            def __init__(self) -> None:
+                self.seen_text = ""
+
+            def parse(self, text: str) -> DependencyParse:
+                self.seen_text = text
+                return DependencyParse(tokens=make_tokens(text), edges=[])
+
+        class EmptyAnchorSelector:
+            def __init__(self) -> None:
+                self.seen_original_question = ""
+
+            def select(self, **kwargs: object) -> AnchorSelectionResult:
+                self.seen_original_question = str(kwargs["original_question"])
+                return AnchorSelectionResult(selected_anchors=[])
+
+        class EmptySemanticASTOptimizer:
+            def __init__(self) -> None:
+                self.seen_original_question = ""
+
+            def optimize(self, **kwargs: object) -> SemanticASTResult:
+                self.seen_original_question = str(kwargs["original_question"])
+                return SemanticASTResult(
+                    status="ok",
+                    primary_operator=SemanticASTPrimaryOperator(operator="NONE"),
+                )
+
+        class EmptySubquestionGenerator:
+            def __init__(self) -> None:
+                self.seen_original_question = ""
+
+            def generate(self, **kwargs: object) -> list[object]:
+                self.seen_original_question = str(kwargs["original_question"])
+                return []
+
+        normalized = "Which of Ryan Tubridy and Mauro Massironi has the greater age?"
+        parser = RecordingParser()
+        anchor_selector = EmptyAnchorSelector()
+        semantic_ast_optimizer = EmptySemanticASTOptimizer()
+        subquestion_generator = EmptySubquestionGenerator()
+
+        result = run_pipeline(
+            record=QuestionRecord(question="Who is older, Ryan Tubridy or Mauro Massironi?"),
+            index=1,
+            mask_span_extractor=MaskSpanExtractor(),
+            parser=parser,
+            graph_builder=GraphBuilder(),
+            anchor_selector=anchor_selector,
+            semantic_ast_optimizer=semantic_ast_optimizer,
+            subquestion_generator=subquestion_generator,
+            question_normalizer=FixedQuestionNormalizer(normalized),
+        )
+
+        self.assertEqual(result["semantic_normalization"].normalized_question, normalized)
+        self.assertEqual(parser.seen_text, "Which of PersonA and PersonB has the greater age?")
+        self.assertEqual(anchor_selector.seen_original_question, normalized)
+        self.assertEqual(semantic_ast_optimizer.seen_original_question, normalized)
+        self.assertEqual(subquestion_generator.seen_original_question, normalized)
+
     def test_complex_film_titles_restore_before_anchor_selection_and_same_is_operator(self) -> None:
         question = (
             "Do director of film Ten9Eight: Shoot For The Moon and director of film "
@@ -403,33 +561,22 @@ class NewDEPOPipelineTests(unittest.TestCase):
             "Who was born earlier, Elmer W. Conti or PersonA?",
         )
 
-    def test_mask_span_llm_accepts_parser_fragile_single_token_entities(self) -> None:
-        question = "Which company developed AlphaGo with IBM?"
-        payload = {
-            "mask_spans": [
-                {
-                    "text": "AlphaGo",
-                    "start_char": question.index("AlphaGo"),
-                    "end_char": question.index("AlphaGo") + len("AlphaGo"),
-                    "kind_hint": "entity",
-                    "semantic_type_hint": "Product",
-                    "reason": "mixed-case product name",
-                },
-                {
-                    "text": "IBM",
-                    "start_char": question.index("IBM"),
-                    "end_char": question.index("IBM") + len("IBM"),
-                    "kind_hint": "entity",
-                    "semantic_type_hint": "Organization",
-                    "reason": "acronym organization name",
-                },
-            ]
-        }
+    def test_mask_span_prompt_targets_multi_word_spans_and_excludes_single_token_entities(self) -> None:
+        fake_llm = FakeLLM({"mask_spans": []})
 
-        mask_result = MaskSpanExtractor(FakeLLM(payload)).extract(question)
+        MaskSpanExtractor(fake_llm).extract(
+            "Which organization did the chief operating officer of the research institute lead?"
+        )
 
-        self.assertEqual([span.text for span in mask_result.mask_spans], ["AlphaGo", "IBM"])
-        self.assertEqual([span.semantic_type_hint for span in mask_result.mask_spans], ["Product", "Organization"])
+        prompt = fake_llm.prompts[0]
+        self.assertIn("multi-word named entities", prompt)
+        self.assertIn("multi-word type variables", prompt)
+        self.assertIn("Decision procedure", prompt)
+        self.assertIn("at least two lexical units", prompt)
+        self.assertIn("single-token entity", prompt)
+        self.assertIn("coordinated alternatives", prompt)
+        self.assertNotIn("AlphaGo", prompt)
+        self.assertNotIn("Elmer W. Conti", prompt)
 
     def test_simple_type_variables_are_not_over_masked(self) -> None:
         question = "Which director is CEO of the university in the city and has nationality?"

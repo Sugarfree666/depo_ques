@@ -214,6 +214,7 @@ def _heuristic_mask_spans(question: str) -> list[MaskSpan]:
     spans.extend(_title_spans_after_type_heads(question))
     spans.extend(_parenthetical_entity_spans(question))
     spans.extend(_quoted_spans(question))
+    spans.extend(_person_name_token_spans(question))
     spans.extend(_capitalized_entity_spans(question))
     spans.extend(_type_phrase_spans(question))
     return _merge_spans(question, spans, [])
@@ -319,6 +320,65 @@ def _quoted_spans(question: str) -> list[MaskSpan]:
                 )
             )
     return spans
+
+
+def _person_name_token_spans(question: str) -> list[MaskSpan]:
+    if not _question_has_human_context(question, None, None):
+        return []
+    spans: list[MaskSpan] = []
+    token_matches = list(re.finditer(r"[A-Za-z][A-Za-z0-9'.-]*", question))
+    index = 0
+    while index < len(token_matches):
+        match = token_matches[index]
+        token = match.group(0).strip()
+        if not _is_person_name_token(token) or _starts_sentence_only(question, match.start(), token):
+            index += 1
+            continue
+        start = match.start()
+        end = match.end()
+        content_count = 1 if token.lower().strip(".") not in PERSON_NAME_PARTICLES else 0
+        cursor = index + 1
+        while cursor < len(token_matches):
+            next_match = token_matches[cursor]
+            between = question[end : next_match.start()]
+            if not between.isspace():
+                break
+            next_token = next_match.group(0).strip()
+            lowered = next_token.lower().strip(".")
+            if lowered in {"and", "or"}:
+                break
+            if not _is_person_name_token(next_token):
+                break
+            end = next_match.end()
+            if lowered not in PERSON_NAME_PARTICLES:
+                content_count += 1
+            cursor += 1
+        text = question[start:end]
+        if content_count >= 2 and _looks_like_person_name(text):
+            spans.append(
+                MaskSpan(
+                    text=text,
+                    start_char=start,
+                    end_char=end,
+                    kind_hint="entity",
+                    semantic_type_hint="Person",
+                    reason="multi-token person name in human context",
+                )
+            )
+            index = cursor
+            continue
+        index += 1
+    return spans
+
+
+def _is_person_name_token(token: str) -> bool:
+    stripped = token.strip()
+    lowered = stripped.lower().strip(".")
+    if lowered in PERSON_NAME_PARTICLES:
+        return True
+    if re.fullmatch(r"[A-Z]\.", stripped):
+        return True
+    return bool(re.fullmatch(r"[A-Z][A-Za-z'.-]*", stripped))
 
 
 def _capitalized_entity_spans(question: str) -> list[MaskSpan]:

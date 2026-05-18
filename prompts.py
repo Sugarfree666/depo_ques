@@ -18,12 +18,13 @@ ALLOWED_OPERATORS = [
 ]
 
 MASK_SPAN_EXTRACTION_SYSTEM = """
-You are implementing DEPO Step 1: selective complex-span masking only.
+You are implementing the DEPO selective complex-span masking step.
 Your job is to identify spans that should be replaced by a POS-hint placeholder before CoreNLP parsing.
-This step protects parser-fragile surface spans only.
+This step protects multi-token surface spans only.
 Do not perform anchor extraction.
 Do not output selected anchors, implicit variables, operators, relations, AST nodes, or subquestions.
-Extract complex named entities, parser-fragile proper names, titles, abbreviations/acronyms, multi-word type variables, and multi-word functional noun phrases that are likely to be fragmented or mistagged by a dependency parser.
+Extract every multi-word named entity/title and every multi-word type or functional head noun phrase that should become one placeholder token.
+Do not mask single-token entities, even if they are mixed-case, abbreviated, or well-known names.
 Keep simple type variables such as director, CEO, university, city, nationality, age, population, country, and actor unmasked unless they are part of a larger multi-word phrase.
 Return valid JSON only.
 """.strip()
@@ -33,12 +34,12 @@ def build_mask_span_extraction_prompt(question: str) -> str:
     schema = {
         "mask_spans": [
             {
-                "text": "Ten9Eight: Shoot For The Moon",
-                "start_char": 20,
-                "end_char": 51,
+                "text": "multi word span",
+                "start_char": 0,
+                "end_char": 15,
                 "kind_hint": "entity",
-                "semantic_type_hint": "Film",
-                "reason": "complex title with digit and colon",
+                "semantic_type_hint": "Entity",
+                "reason": "brief parser-protection reason",
             }
         ]
     }
@@ -46,21 +47,47 @@ def build_mask_span_extraction_prompt(question: str) -> str:
 Identify only spans that should be masked before CoreNLP parsing.
 
 This is not anchor extraction and not question decomposition. The output is only a list of surface spans in the original question that need parser protection.
+In short, target multi-word named entities and multi-word type variables with at least two lexical units.
 
-Mask these span types:
-- Complex named entities with colon, parentheses, quotes, digits, hyphens, apostrophes, periods, slashes, or other special punctuation.
-- Parser-fragile proper names, including person names, organization names, institution names, place names, product names, work titles, event names, abbreviations, and acronyms.
-- Continuous multi-word named entities such as Ryan Tubridy, New York City, University of Southern California, or Bank of America.
-- Titles and named works such as films, books, songs, albums, series, papers, statutes, and artworks; keep the whole title as one span.
-- Multi-word type variables or functional noun phrases such as distribution network, artificial intelligence company, mixed-use space, local food distribution network, public research university, or chief executive officer.
+Core target:
+- Mask every multi-word named entity, every multi-word title, and every multi-word type/function noun phrase.
+- The span must contain at least two content lexical units. Determiners such as the/a/an do not count. Middle initials such as "W." count as part of a multi-word person name.
+- Do not mask a single-token entity by itself, even if it is mixed-case, has digits, is an acronym, or appears parser-fragile.
+
+Extract exactly these two categories:
+
+Category A: Proper-name spans.
+- Continuous multi-token person names, organization names, institution names, place names, event names, product names, and named works.
+- These are mandatory mask spans whenever present.
+- A personal name pattern such as First Last, First Middle Last, First M. Last, or multi-token name particles must be returned.
+- In a comparison or coordination with "and/or", apply this to every option independently.
+
+Category B: Compound-head type spans.
+- A compact noun phrase whose rightmost word is the semantic head, and whose earlier words are essential compound/classifying modifiers of that head.
+- The head must be an entity/type/function/object/role class noun.
+- The phrase should still name a reusable type or object class after masking.
+- Valid type spans normally have at least one content modifier before the head, not just a determiner before a single noun.
+- If a quality/evaluative adjective appears before a compound head phrase, drop the quality adjective and keep the compact compound head phrase.
 
 Span boundary rules:
 - Use exact original question character offsets, start inclusive and end exclusive.
 - Return the minimal contiguous span that should become one placeholder token.
 - For named entities and titles, keep the full official/name-like surface form.
 - For type variables and functional noun phrases, exclude leading determiners such as the/a/an unless they are part of a named title.
-- Do not include relative clauses, prepositional complements, comparison words, or coordination words unless they are part of a proper name/title.
+- For compound-head type spans, include only essential compound/classifying modifiers and the head noun.
+- Do not include quality/evaluative adjectives, relative clauses, participial clauses, prepositional complements, comparison words, or coordination words unless they are part of a proper name/title.
 - If two candidate spans overlap, prefer the larger coherent entity/title, or the compact functional noun phrase for type variables.
+- Scan the whole question. In coordinated alternatives, extract every eligible multi-word entity, not just one side.
+
+Negative boundary rules:
+- Do not mask modifier-only phrases that do not include the functional/type head noun.
+- Do not mask purpose/topic phrases after prepositions such as for/about/with unless that prepositional object itself is the main type being asked for.
+- Do not mask durations, quantities, measurements, or temporal expressions.
+- Do not mask adjective-only phrases or descriptive property phrases.
+- Do not mask spans containing verbs, gerunds, or participles unless the span is an official named title.
+- Do not mask determiner + single noun spans; determiners do not make a one-word type variable maskable.
+- Do not mask material/topic phrases that only specify the domain, purpose, or contents of another head noun.
+- Do not mask a phrase just because it is multi-word; it must satisfy Category A or Category B.
 
 Semantic type hints:
 - Choose a semantic_type_hint that preserves the original POS/semantic role for placeholder generation.
@@ -72,6 +99,15 @@ Semantic type hints:
 
 Do not mask simple one-word type variables by default:
 director, CEO, university, city, nationality, age, population, country, actor.
+
+Decision procedure:
+1. First scan for Category A proper-name spans. Return every multi-token proper name. Do not skip names just because they are syntactically simple.
+2. Then scan for Category B compound-head type spans. Keep only compact modifier + head noun phrases.
+3. For proper names, include all adjacent name tokens and initials in the person/place/organization/title name.
+4. For type/function phrases, the head noun must be included, nonessential quality adjectives should be excluded, and determiners do not count as modifiers.
+5. Drop single-token named entities and single-word type variables.
+6. Drop determiner + single noun spans, modifier-only phrases, duration/quantity phrases, verb phrases, and prepositional purpose/context phrases.
+7. For coordinated alternatives, apply the same criteria independently to each side.
 
 Forbidden outputs:
 - selected anchors
@@ -88,6 +124,84 @@ Output JSON with exactly this shape:
 
 Question:
 {question}
+""".strip()
+
+
+SEMANTIC_QUESTION_NORMALIZATION_SYSTEM = """
+You are implementing a semantic question normalization step before dependency parsing.
+First decide whether the input question needs normalization.
+If the question is already a clear, single, dependency-parser-friendly question, return the original question unchanged.
+If normalization is needed, rewrite the input as one semantically equivalent question whose syntax is clearer and more explicit for a dependency parser.
+Do not answer the question.
+Do not decompose the question into atomic questions.
+Do not output reasoning, ASTs, graphs, operators, execution plans, or subquestions.
+Do not introduce new named entities.
+Preserve every placeholder token exactly if placeholders are present.
+Preserve explicit type variables, answer type, and question meaning.
+Only make an implicit type variable explicit when it is licensed by a clear cue in the original question.
+If a safe rewrite is not possible, return the original question unchanged.
+Return valid JSON only.
+""".strip()
+
+
+def build_semantic_question_normalization_prompt(
+    question: str,
+    placeholders: list[str] | None = None,
+) -> str:
+    placeholders = placeholders or []
+    schema = {
+        "normalized_question": "the original question if no rewrite is needed, otherwise one semantically equivalent normalized single-sentence question",
+        "changed": True,
+        "added_type_variables": [
+            {
+                "text": "explicit type variable added by the rewrite",
+                "trigger_text": "exact cue in the original question",
+                "reason": "brief justification",
+            }
+        ],
+    }
+    return f"""
+Decide whether the question needs semantic normalization for dependency parsing.
+
+Original question:
+{question}
+
+Placeholder tokens that must be preserved exactly:
+{json.dumps(placeholders, ensure_ascii=False, indent=2)}
+
+Rewrite goals:
+- If the original question is already clear, complete, and parser-friendly, set normalized_question to the exact original question and changed to false.
+- If the original question has ellipsis, compressed coordination, unclear attachment, implicit comparison attributes, or a structure likely to confuse dependency parsing, provide a normalized question.
+- Keep the output as exactly one question.
+- Remove ellipsis and expand shared coordinated structure when doing so does not change meaning.
+- Make relationships between entities, type variables, comparison targets, logical constraints, and answer focus syntactically explicit.
+- If a comparative, superlative, ordinal, location, time, identity, membership, or predicate cue clearly implies an attribute/type variable, the rewrite may name that variable explicitly.
+- Keep all explicit type variables from the input.
+- Keep all placeholders exactly as written, with the same number of occurrences.
+- Keep all named entities exactly as written.
+- Prefer a direct, parser-friendly clause structure over compressed coordination.
+- For coordination or comparison, make each compared or coordinated item attach clearly to the same relation or attribute.
+- Keep the result a natural English question, not a statement, fragment, list, or template.
+
+Strict restrictions:
+- Do not answer the question.
+- Do not split the input into multiple questions.
+- Do not output an AST, graph, decomposition, solving order, or reasoning trace.
+- Do not introduce a named entity not present in the original question.
+- Do not infer missing facts, categories, locations, dates, genders, nationalities, occupations, or aliases from world knowledge.
+- Do not remove or rename any placeholder.
+- Do not change the answer type.
+- Do not change the comparison, set, temporal, location, or logical condition being asked.
+- If the rewrite would require guessing unstated facts or entity types, return the original question unchanged and changed=false.
+
+Added type-variable reporting:
+- If the rewrite adds an explicit type-variable noun that was only implicit in the original, list it in added_type_variables.
+- The trigger_text must be an exact cue span from the original question.
+- Do not list variables that already appeared explicitly in the input.
+- If normalized_question is exactly the original question, added_type_variables must be an empty list.
+
+Output JSON with exactly this shape:
+{json.dumps(schema, ensure_ascii=False, indent=2)}
 """.strip()
 
 
